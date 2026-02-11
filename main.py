@@ -30,12 +30,29 @@ class Database:
         self.pool = None
 
     async def connect(self):
+        """Создаёт пул соединений с PostgreSQL с повторными попытками"""
         if self.pool is None:
-            self.pool = await asyncpg.create_pool(
-                os.environ.get("DATABASE_URL"),
-                min_size=1,
-                max_size=10
-            )
+            db_url = os.environ.get("DATABASE_URL")
+            if not db_url:
+                print("❌ ОШИБКА: DATABASE_URL не задан!")
+                return None
+    
+            for attempt in range(5):  # 5 попыток
+                try:
+                    self.pool = await asyncpg.create_pool(
+                        db_url,
+                        min_size=1,
+                        max_size=10,
+                        command_timeout=60
+                    )
+                    print("✅ Подключение к БД установлено")
+                    break
+                except Exception as e:
+                    print(f"⚠️ Попытка {attempt+1}/5 подключения к БД не удалась: {e}")
+                    if attempt == 4:
+                        print("❌ Не удалось подключиться к БД после 5 попыток")
+                        return None
+                    await asyncio.sleep(2 ** attempt)  # экспоненциальная задержка
         return self.pool
 
     async def init_db(self):
