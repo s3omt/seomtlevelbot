@@ -8,7 +8,11 @@ import sys
 import aiohttp
 from collections import defaultdict
 import pytz
-import math  # <-- НОВОЕ: для расчёта уровня
+import math
+import io
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 from typing import Dict, List, Optional, Tuple, Any
 import threading
 from flask import Flask, jsonify
@@ -73,7 +77,7 @@ class Database:
             """)
             print("✅ Таблица warns готова")
 
-            # ----- НОВОЕ: ТАБЛИЦА УРОВНЕЙ -----
+            # Таблица уровней
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS levels (
                     user_id BIGINT PRIMARY KEY,
@@ -84,7 +88,21 @@ class Database:
             """)
             print("✅ Таблица levels готова")
 
-    # ----- МЕТОДЫ ДЛЯ ПОЛЬЗОВАТЕЛЕЙ (БЕЗ ИЗМЕНЕНИЙ) -----
+            # Таблица истории активности
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS user_history (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT,
+                    guild_id BIGINT,
+                    date DATE DEFAULT CURRENT_DATE,
+                    voice_minutes INT DEFAULT 0,
+                    messages INT DEFAULT 0,
+                    UNIQUE(user_id, guild_id, date)
+                )
+            """)
+            print("✅ Таблица user_history готова")
+
+    # ----- МЕТОДЫ ДЛЯ ПОЛЬЗОВАТЕЛЕЙ -----
     async def add_message(self, user_id: int):
         pool = await self.connect()
         async with pool.acquire() as conn:
@@ -161,12 +179,10 @@ class Database:
                 'total_voice': row['total_voice']
             }
 
-    # ----- НОВОЕ: МЕТОДЫ ДЛЯ РАБОТЫ С УРОВНЯМИ -----
+    # ----- МЕТОДЫ ДЛЯ РАБОТЫ С УРОВНЯМИ -----
     async def add_xp(self, user_id: int, xp: int):
-        """Добавляет опыт, обновляет уровень. Возвращает (повысился_ли_уровень, новый_уровень)"""
         pool = await self.connect()
         async with pool.acquire() as conn:
-            # Получаем текущие значения
             row = await conn.fetchrow(
                 "SELECT xp, level FROM levels WHERE user_id = $1",
                 user_id
@@ -182,7 +198,6 @@ class Database:
                     user_id
                 )
 
-            # Формула: уровень = (sqrt(100*(2*xp+25)) + 50) // 100
             new_level = int((math.sqrt(100 * (2 * new_xp + 25)) + 50) // 100)
 
             await conn.execute("""
@@ -194,7 +209,6 @@ class Database:
             return new_level > old_level, new_level
 
     async def get_level_info(self, user_id: int):
-        """Возвращает информацию об уровне: xp, level, xp_for_next, progress"""
         pool = await self.connect()
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
@@ -204,7 +218,6 @@ class Database:
             if row:
                 xp = row['xp']
                 level = row['level']
-                # XP до следующего уровня: next_level_xp = ((level+1)*100 - 50)^2 / 100
                 next_level_xp = int(((level + 1) * 100 - 50) ** 2 / 100)
                 progress = xp / next_level_xp if next_level_xp > 0 else 0
                 return {
@@ -218,12 +231,36 @@ class Database:
                 return {
                     'xp': 0,
                     'level': 0,
-                    'next_xp': 25,  # для 1 уровня нужно 25 XP
+                    'next_xp': 25,
                     'progress': 0,
                     'remaining': 25
                 }
 
-    # ----- НАСТРОЙКИ СЕРВЕРОВ (БЕЗ ИЗМЕНЕНИЙ) -----
+    # ----- ИСТОРИЯ АКТИВНОСТИ (ДЛЯ ГРАФИКОВ) -----
+    async def save_daily_stats(self, user_id: int, guild_id: int, voice_minutes: int, messages: int):
+        pool = await self.connect()
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO user_history (user_id, guild_id, date, voice_minutes, messages)
+                VALUES ($1, $2, CURRENT_DATE, $3, $4)
+                ON CONFLICT (user_id, guild_id, date) DO UPDATE
+                SET voice_minutes = EXCLUDED.voice_minutes,
+                    messages = EXCLUDED.messages
+            """, user_id, guild_id, voice_minutes, messages)
+
+    async def get_user_history(self, user_id: int, guild_id: int, days: int = 30):
+        pool = await self.connect()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT date, voice_minutes, messages
+                FROM user_history
+                WHERE user_id = $1 AND guild_id = $2
+                ORDER BY date DESC
+                LIMIT $3
+            """, user_id, guild_id, days)
+            return [dict(row) for row in rows]
+
+    # ----- НАСТРОЙКИ СЕРВЕРОВ -----
     async def get_guild_config(self, guild_id: int):
         pool = await self.connect()
         async with pool.acquire() as conn:
@@ -266,7 +303,7 @@ class Database:
                 ON CONFLICT (guild_id) DO UPDATE SET {key} = $2
             """, guild_id, value)
 
-    # ----- ПРЕДУПРЕЖДЕНИЯ (БЕЗ ИЗМЕНЕНИЙ) -----
+    # ----- ПРЕДУПРЕЖДЕНИЯ -----
     async def add_warn(self, guild_id: int, user_id: int, moderator_id: int, reason: str):
         pool = await self.connect()
         async with pool.acquire() as conn:
@@ -297,7 +334,6 @@ class Database:
         async with pool.acquire() as conn:
             await conn.execute("DELETE FROM warns WHERE id = $1", warn_id)
 
-# Создаём глобальный экземпляр базы данных
 db = Database()
 
 # ==================== КОНФИГУРАЦИЯ ====================
@@ -322,26 +358,21 @@ def get_moscow_time(dt=None):
 def format_moscow_time(dt=None, format_str="%d.%m.%Y %H:%M:%S"):
     return get_moscow_time(dt).strftime(format_str)
 
-# ==================== КОНФИГУРАЦИЯ РОЛЕЙ ====================
-ROLES_CONFIG = {
-    "Залётный": {"voice_minutes": 0},
-    "Ньюфажина": {"voice_minutes": 300},
-    "Бывалый": {"voice_minutes": 1200},
-    "Додик": {"voice_minutes": 3000},
-    "Дэбил": {"voice_minutes": 10000},
-    "Джокер Гребанный Циник": {"voice_minutes": 30000}
+# ==================== КОНФИГУРАЦИЯ РОЛЕЙ ПО УРОВНЯМ ====================
+LEVEL_ROLES = {
+    5: "Ньюфажина",
+    10: "Нормис",
+    20: "Бывалый",
+    30: "Альтуха",
+    40: "Опиум",
+    50: "Игрок",
+    60: "Тектоник",
+    70: "Вайперр",
+    85: "Модератор по сиськам",
+    100: "Админ по ляжкам"
 }
 
-ROLE_COLORS = {
-    "Залётный": 0x9E9E9E,
-    "Ньюфажина": 0x4CAF50,
-    "Бывалый": 0x2196F3,
-    "Додик": 0xFF9800,
-    "Дэбил": 0x9C27B0,
-    "Джокер Гребанный Циник": 0xFF5722
-}
-
-ROLE_ORDER = list(ROLES_CONFIG.keys())
+DEFAULT_ROLE_NAME = "Залётный"  # Начальная роль при входе
 
 # ==================== СОЗДАНИЕ БОТА ====================
 intents = discord.Intents.default()
@@ -361,7 +392,7 @@ bot = commands.Bot(
 voice_sessions = {}
 guild_config_cache = {}
 
-# ==================== TELEGRAM БОТ (БЕЗ ИЗМЕНЕНИЙ) ====================
+# ==================== TELEGRAM БОТ ====================
 class TelegramBot:
     def __init__(self, token: str, chat_id: str):
         self.token = token
@@ -474,7 +505,7 @@ class TelegramBot:
                 "Доступные команды:\n"
                 "• `/stats` — статистика бота\n"
                 "• `/top` — топ пользователей\n"
-                "• `/roles` — список ролей\n"
+                "• `/roles` — список ролей по уровням\n"
                 "• `/help` — помощь"
             )
         elif text == "/stats":
@@ -489,10 +520,9 @@ class TelegramBot:
                 text_lines.append(f"{i}. ID `{uid}` — {count} сообщ.")
             await self.send_message("\n".join(text_lines))
         elif text == "/roles":
-            lines = ["🎖️ *Роли за голосовую активность:*\n"]
-            for role in ROLE_ORDER:
-                minutes = ROLES_CONFIG[role]["voice_minutes"]
-                lines.append(f"**{role}** — {minutes//60}ч {minutes%60}м")
+            lines = ["🎖️ *Роли за уровни:*\n"]
+            for level, role in LEVEL_ROLES.items():
+                lines.append(f"**Уровень {level}** — {role}")
             await self.send_message("\n".join(lines))
         elif text == "/help":
             await self.send_message(
@@ -544,7 +574,7 @@ async def set_log_channel(guild_id: int, channel_id: int):
         config['log_channel'] = channel_id
         guild_config_cache[guild_id] = config
 
-# ==================== ЛОГГЕР (БЕЗ ИЗМЕНЕНИЙ) ====================
+# ==================== ЛОГГЕР ====================
 class Logger:
     @staticmethod
     async def log_event(guild: discord.Guild, event_type: str, title: str, description: str,
@@ -611,7 +641,7 @@ class Logger:
         except Exception as e:
             print(f"❌ Logger error: {e}")
 
-# ==================== МЕНЕДЖЕР РОЛЕЙ (БЕЗ ИЗМЕНЕНИЙ) ====================
+# ==================== МЕНЕДЖЕР РОЛЕЙ (ПОЛНОСТЬЮ ПЕРЕРАБОТАН) ====================
 class RoleManager:
     @staticmethod
     async def check_hierarchy(guild: discord.Guild, role: discord.Role) -> bool:
@@ -622,17 +652,23 @@ class RoleManager:
 
     @staticmethod
     async def ensure_role_exists(guild: discord.Guild, role_name: str):
+        """Создаёт роль, если её нет на сервере"""
         role = discord.utils.get(guild.roles, name=role_name)
         if role:
             return role
         try:
-            color = ROLE_COLORS.get(role_name, 0x9E9E9E)
+            # Генерируем цвет на основе названия (для красоты)
+            color = discord.Color.from_rgb(
+                (hash(role_name) & 0xFF0000) >> 16,
+                (hash(role_name) & 0x00FF00) >> 8,
+                hash(role_name) & 0x0000FF
+            )
             role = await guild.create_role(
                 name=role_name,
-                color=discord.Color(color),
-                hoist=True,
+                color=color,
+                hoist=True,  # Отображать отдельно в списке
                 mentionable=False,
-                reason="Автоматическое создание роли"
+                reason="Автоматическое создание роли для уровней"
             )
             print(f"✅ Создана роль {role_name} на {guild.name}")
             await Logger.log_event(
@@ -641,7 +677,7 @@ class RoleManager:
                 title="Создана новая роль",
                 description=f"Роль **{role_name}** создана автоматически",
                 color=0x2ecc71,
-                fields={"Цвет": f"`#{color:06x}`"}
+                fields={"Причина": "Система уровней"}
             )
             return role
         except Exception as e:
@@ -650,86 +686,116 @@ class RoleManager:
 
     @staticmethod
     async def give_default_role(member: discord.Member):
+        """Выдаёт начальную роль 'Залётный' новым участникам"""
         try:
-            for role_name in ROLES_CONFIG.keys():
-                role = discord.utils.get(member.guild.roles, name=role_name)
+            # Если у пользователя уже есть какая-то роль из системы уровней — пропускаем
+            for level_role in LEVEL_ROLES.values():
+                role = discord.utils.get(member.guild.roles, name=level_role)
                 if role and role in member.roles:
                     return
-            role = discord.utils.get(member.guild.roles, name="Залётный")
+
+            role = discord.utils.get(member.guild.roles, name=DEFAULT_ROLE_NAME)
             if not role:
-                role = await RoleManager.ensure_role_exists(member.guild, "Залётный")
+                role = await RoleManager.ensure_role_exists(member.guild, DEFAULT_ROLE_NAME)
             if role and role not in member.roles and await RoleManager.check_hierarchy(member.guild, role):
-                await member.add_roles(role, reason="Начальная роль")
-                print(f"✅ Выдана роль Залётный {member}")
+                await member.add_roles(role, reason="Начальная роль при входе")
+                print(f"✅ Выдана начальная роль {DEFAULT_ROLE_NAME} {member}")
                 await Logger.log_event(
                     guild=member.guild,
                     event_type="role",
                     title="Выдана начальная роль",
-                    description=f"Пользователь {member.mention} получил роль **Залётный**",
+                    description=f"Пользователь {member.mention} получил роль **{DEFAULT_ROLE_NAME}**",
                     color=0x2ecc71,
                     user=member
                 )
         except Exception as e:
-            print(f"❌ Ошибка выдачи роли: {e}")
+            print(f"❌ Ошибка выдачи начальной роли: {e}")
 
     @staticmethod
     async def check_and_give_roles(member: discord.Member):
+        """Проверяет уровень и выдаёт соответствующую роль, удаляя предыдущие роли уровней"""
         try:
-            stats = await db.get_user_stats(member.id)
-            voice_minutes = stats['voice_minutes']
+            # Получаем уровень пользователя
+            level_info = await db.get_level_info(member.id)
+            current_level = level_info['level']
 
-            earned_role_name = "Залётный"
-            for role_name in reversed(ROLE_ORDER):
-                if voice_minutes >= ROLES_CONFIG[role_name]["voice_minutes"]:
-                    earned_role_name = role_name
+            # Определяем, какая роль должна быть у этого уровня
+            target_role_name = None
+            # Проходим по порогам от большего к меньшему
+            for threshold in sorted(LEVEL_ROLES.keys(), reverse=True):
+                if current_level >= threshold:
+                    target_role_name = LEVEL_ROLES[threshold]
                     break
 
-            earned_role = discord.utils.get(member.guild.roles, name=earned_role_name)
-            if not earned_role:
-                earned_role = await RoleManager.ensure_role_exists(member.guild, earned_role_name)
-
-            if not earned_role or earned_role in member.roles:
-                return
-            if not await RoleManager.check_hierarchy(member.guild, earned_role):
+            if not target_role_name:
+                # Если уровень ниже первого порога — ничего не делаем
                 return
 
+            # Получаем целевую роль
+            target_role = discord.utils.get(member.guild.roles, name=target_role_name)
+            if not target_role:
+                target_role = await RoleManager.ensure_role_exists(member.guild, target_role_name)
+                if not target_role:
+                    return
+
+            # Проверяем иерархию
+            if not await RoleManager.check_hierarchy(member.guild, target_role):
+                print(f"⚠️ Невозможно выдать роль {target_role_name}: недостаточно прав")
+                return
+
+            # Если у пользователя уже есть эта роль — ничего не делаем
+            if target_role in member.roles:
+                return
+
+            # Удаляем все предыдущие роли из системы уровней
             roles_to_remove = []
-            for role_name in ROLES_CONFIG.keys():
-                if role_name != earned_role_name:
-                    old_role = discord.utils.get(member.guild.roles, name=role_name)
-                    if old_role and old_role in member.roles:
-                        roles_to_remove.append(old_role)
+            for role_name in LEVEL_ROLES.values():
+                if role_name == target_role_name:
+                    continue
+                old_role = discord.utils.get(member.guild.roles, name=role_name)
+                if old_role and old_role in member.roles:
+                    roles_to_remove.append(old_role)
+
+            # Также удаляем начальную роль, если есть
+            default_role = discord.utils.get(member.guild.roles, name=DEFAULT_ROLE_NAME)
+            if default_role and default_role in member.roles:
+                roles_to_remove.append(default_role)
+
+            # Выполняем удаление
             if roles_to_remove:
-                await member.remove_roles(*roles_to_remove, reason="Обновление роли")
+                await member.remove_roles(*roles_to_remove, reason="Обновление роли по уровню")
 
-            await member.add_roles(earned_role, reason=f"Голос: {voice_minutes} мин")
-            print(f"✅ {member} получил роль {earned_role_name} ({voice_minutes} мин)")
+            # Выдаём новую роль
+            await member.add_roles(target_role, reason=f"Достигнут уровень {current_level}")
+            print(f"✅ {member} получил роль {target_role_name} (уровень {current_level})")
 
+            # Логируем событие
             await Logger.log_event(
                 guild=member.guild,
                 event_type="role",
                 title="Получена новая роль",
-                description=f"Пользователь {member.mention} получил роль **{earned_role_name}**",
+                description=f"Пользователь {member.mention} получил роль **{target_role_name}**",
                 color=0x2ecc71,
                 user=member,
-                fields={"Голосовая активность": f"{voice_minutes // 60}ч {voice_minutes % 60}м"}
+                fields={"Уровень": str(current_level), "Опыт": f"{level_info['xp']} XP"}
             )
 
+            # Уведомление в Telegram (если включено)
             if telegram.enabled:
                 config = await get_guild_config(member.guild.id)
                 if config.get("telegram_notify_role", False):
                     await telegram.send_alert(
-                        "🎉 Новая роль",
-                        f"Пользователь **{member.display_name}** получил роль **{earned_role_name}**\n\n"
-                        f"🎤 Голос: {voice_minutes // 60}ч {voice_minutes % 60}м\n"
-                        f"💬 Сообщений: {stats['messages']}",
+                        "🎉 Новая роль по уровню",
+                        f"Пользователь **{member.display_name}** получил роль **{target_role_name}**\n\n"
+                        f"📈 Уровень: **{current_level}**\n"
+                        f"✨ Опыт: {level_info['xp']} XP",
                         "success"
                     )
 
         except Exception as e:
-            print(f"❌ Ошибка обновления роли: {e}")
+            print(f"❌ Ошибка обновления ролей по уровню: {e}")
 
-# ==================== ЗАДАЧИ (ОБНОВЛЕНЫ ДЛЯ УРОВНЕЙ) ====================
+# ==================== ЗАДАЧИ ====================
 @tasks.loop(minutes=5)
 async def check_voice_time():
     try:
@@ -742,16 +808,16 @@ async def check_voice_time():
                 if member and member.voice and member.voice.channel:
                     # Добавляем голосовое время в таблицу users
                     await db.add_voice_time(member_id, 5)
-                    # ----- НОВОЕ: НАЧИСЛЯЕМ ОПЫТ ЗА ГОЛОС (2 XP в минуту = 10 XP за 5 минут) -----
+                    # Начисляем опыт за голос (2 XP в минуту = 10 XP за 5 минут)
                     leveled_up, new_level = await db.add_xp(member_id, 10)
                     if leveled_up:
                         try:
                             await member.send(f"🎉 Поздравляю! Вы достигли **{new_level} уровня**!")
                         except:
                             pass
-                    # -------------------------------------------------------------
+                        # Проверяем и выдаём новую роль по уровню
+                        await RoleManager.check_and_give_roles(member)
                     voice_sessions[user_id] = now - datetime.timedelta(minutes=duration % 5)
-                    await RoleManager.check_and_give_roles(member)
                     break
     except Exception as e:
         print(f"❌ Ошибка check_voice_time: {e}")
@@ -768,10 +834,10 @@ async def daily_report():
     except Exception as e:
         print(f"❌ Ошибка daily_report: {e}")
 
-@tasks.loop(time=datetime_time(hour=17, minute=0))
+@tasks.loop(time=datetime_time(hour=17, minute=0))  # 17:00 UTC = 20:00 MSK
 async def weekly_top():
     now = get_moscow_time()
-    if now.weekday() != 6:
+    if now.weekday() != 6:  # воскресенье
         return
 
     for guild in bot.guilds:
@@ -813,7 +879,28 @@ async def weekly_top():
         if channel:
             await channel.send(embed=embed)
 
-# ==================== СОБЫТИЯ DISCORD (ОБНОВЛЕНЫ ДЛЯ УРОВНЕЙ) ====================
+@tasks.loop(time=datetime_time(hour=0, minute=5))  # 00:05 МСК (21:05 UTC)
+async def collect_stats():
+    """Раз в сутки собирает дневную статистику всех участников"""
+    try:
+        print("📊 Начинаем сбор дневной статистики...")
+        for guild in bot.guilds:
+            for member in guild.members:
+                if member.bot:
+                    continue
+                stats = await db.get_user_stats(member.id)
+                await db.save_daily_stats(
+                    member.id,
+                    guild.id,
+                    stats['voice_minutes'],
+                    stats['messages']
+                )
+            print(f"   ✅ {guild.name}: статистика сохранена")
+        print("✅ Дневная статистика успешно собрана")
+    except Exception as e:
+        print(f"❌ Ошибка сбора статистики: {e}")
+
+# ==================== СОБЫТИЯ DISCORD ====================
 @bot.event
 async def on_ready():
     print(f"✅ Бот {bot.user} запущен!")
@@ -824,6 +911,7 @@ async def on_ready():
     print(f"🐍 Python: {sys.version}")
     print(f"📱 Telegram: {'✅' if telegram.enabled else '❌'}")
 
+    # Очистка старых слэш-команд
     try:
         bot.tree.clear_commands(guild=None)
         await bot.tree.sync()
@@ -834,6 +922,7 @@ async def on_ready():
     except Exception as e:
         print(f"⚠️ Ошибка очистки команд: {e}")
 
+    # Запуск задач
     if not check_voice_time.is_running():
         check_voice_time.start()
         print("⏱️ Запущена проверка голосового времени")
@@ -845,12 +934,20 @@ async def on_ready():
     if not weekly_top.is_running():
         weekly_top.start()
         print("📆 Запущена еженедельная отправка топов")
+    if not collect_stats.is_running():
+        collect_stats.start()
+        print("📊 Запущен сбор дневной статистики")
 
+    # Создаём роли уровней на всех серверах
     for guild in bot.guilds:
         print(f"\n🔍 Сервер: {guild.name}")
-        for role_name in ROLES_CONFIG.keys():
+        # Создаём начальную роль
+        await RoleManager.ensure_role_exists(guild, DEFAULT_ROLE_NAME)
+        # Создаём роли уровней
+        for role_name in LEVEL_ROLES.values():
             await RoleManager.ensure_role_exists(guild, role_name)
 
+    # Выдаём начальные роли всем участникам
     print("\n🎯 Выдача начальных ролей...")
     for guild in bot.guilds:
         members = [m for m in guild.members if not m.bot]
@@ -860,6 +957,7 @@ async def on_ready():
             await asyncio.sleep(0.05)
     print("✅ Начальная выдача ролей завершена!")
 
+    # Логирование запуска
     for guild in bot.guilds:
         await Logger.log_event(
             guild=guild,
@@ -945,16 +1043,17 @@ async def on_message(message):
     if message.author.bot:
         return
     if not message.content.startswith('!'):
-        # Статистика сообщений
         await db.add_message(message.author.id)
-        # ----- НОВОЕ: НАЧИСЛЯЕМ ОПЫТ ЗА СООБЩЕНИЕ (5 XP) -----
+        # Начисляем опыт за сообщение (5 XP)
         leveled_up, new_level = await db.add_xp(message.author.id, 5)
         if leveled_up:
             try:
                 await message.author.send(f"🎉 Поздравляю! Вы достигли **{new_level} уровня**!")
             except:
                 pass
-        # -------------------------------------------------------
+            # Проверяем и выдаём новую роль по уровню
+            if isinstance(message.author, discord.Member):
+                await RoleManager.check_and_give_roles(message.author)
         if isinstance(message.author, discord.Member):
             await RoleManager.check_and_give_roles(message.author)
     await bot.process_commands(message)
@@ -1031,7 +1130,7 @@ async def on_voice_state_update(member, before, after):
             duration = (now - voice_sessions[user_id]).total_seconds() / 60
             if duration >= 1:
                 await db.add_voice_time(member.id, int(duration))
-                # ----- НОВОЕ: НАЧИСЛЯЕМ ОПЫТ ЗА ГОЛОС (2 XP в минуту) -----
+                # Начисляем опыт за голос (2 XP в минуту)
                 xp_gain = int(duration) * 2
                 leveled_up, new_level = await db.add_xp(member.id, xp_gain)
                 if leveled_up:
@@ -1039,7 +1138,7 @@ async def on_voice_state_update(member, before, after):
                         await member.send(f"🎉 Поздравляю! Вы достигли **{new_level} уровня**!")
                     except:
                         pass
-                # ----------------------------------------------------------
+                    await RoleManager.check_and_give_roles(member)
                 await RoleManager.check_and_give_roles(member)
                 config = await get_guild_config(member.guild.id)
                 if config.get("voice_events", True):
@@ -1063,10 +1162,15 @@ async def on_voice_state_update(member, before, after):
             duration = (now - voice_sessions[user_id]).total_seconds() / 60
             if duration >= 1:
                 await db.add_voice_time(member.id, int(duration))
-                # ----- НОВОЕ: ОПЫТ ЗА ПРЕДЫДУЩИЙ КАНАЛ -----
+                # Начисляем опыт за предыдущий канал
                 xp_gain = int(duration) * 2
-                await db.add_xp(member.id, xp_gain)
-                # --------------------------------------------
+                leveled_up, new_level = await db.add_xp(member.id, xp_gain)
+                if leveled_up:
+                    try:
+                        await member.send(f"🎉 Поздравляю! Вы достигли **{new_level} уровня**!")
+                    except:
+                        pass
+                    await RoleManager.check_and_give_roles(member)
             voice_sessions[user_id] = now
             config = await get_guild_config(member.guild.id)
             if config.get("voice_events", True):
@@ -1116,13 +1220,12 @@ async def on_guild_channel_delete(channel: discord.abc.GuildChannel):
         }
     )
 
-# ==================== КОМАНДЫ DISCORD (ОБНОВЛЕНЫ) ====================
+# ==================== КОМАНДЫ DISCORD ====================
 @bot.command(name="статистика")
 async def stats(ctx, member: discord.Member = None):
     if not member:
         member = ctx.author
     data = await db.get_user_stats(member.id)
-    # ----- НОВОЕ: ПОЛУЧАЕМ ДАННЫЕ УРОВНЯ -----
     level_info = await db.get_level_info(member.id)
 
     embed = discord.Embed(
@@ -1140,31 +1243,26 @@ async def stats(ctx, member: discord.Member = None):
         value=f"**{data['messages']}**",
         inline=True
     )
-    # ----- НОВОЕ: ПОЛЕ С УРОВНЕМ -----
     embed.add_field(
         name="📈 Уровень",
         value=f"**{level_info['level']}** (✨ {level_info['xp']} XP)",
         inline=True
     )
 
-    current_role = "Залётный"
-    for role_name in reversed(ROLE_ORDER):
-        if data['voice_minutes'] >= ROLES_CONFIG[role_name]["voice_minutes"]:
-            current_role = role_name
+    # Текущая роль по уровню
+    current_role = DEFAULT_ROLE_NAME
+    for threshold in sorted(LEVEL_ROLES.keys(), reverse=True):
+        if level_info['level'] >= threshold:
+            current_role = LEVEL_ROLES[threshold]
             break
     embed.add_field(name="👑 Текущая роль", value=f"**{current_role}**", inline=False)
 
-    current_index = ROLE_ORDER.index(current_role)
-    if current_index < len(ROLE_ORDER) - 1:
-        next_role = ROLE_ORDER[current_index + 1]
-        required = ROLES_CONFIG[next_role]["voice_minutes"]
-        remaining = max(0, required - data['voice_minutes'])
-        progress = (data['voice_minutes'] / required) * 100 if required > 0 else 0
-        embed.add_field(
-            name=f"🎯 До {next_role}",
-            value=f"Осталось: **{remaining // 60}ч {remaining % 60}м**\nПрогресс: `{progress:.1f}%`",
-            inline=False
-        )
+    # Прогресс до следующего уровня
+    embed.add_field(
+        name=f"🎯 До уровня {level_info['level'] + 1}",
+        value=f"Осталось: **{level_info['remaining']} XP**\nПрогресс: `{level_info['progress']*100:.1f}%`",
+        inline=False
+    )
 
     embed.set_thumbnail(url=member.display_avatar.url)
     embed.set_footer(text=f"ID: {member.id} • Время МСК")
@@ -1198,7 +1296,6 @@ async def top(ctx):
     embed.set_footer(text=f"Всего в базе: {total_users} пользователей • Время МСК")
     await ctx.send(embed=embed)
 
-# ----- НОВАЯ КОМАНДА: УРОВЕНЬ -----
 @bot.command(name="уровень", aliases=["level", "lvl"])
 async def level(ctx, member: discord.Member = None):
     """Показывает уровень, опыт и прогресс до следующего уровня"""
@@ -1226,7 +1323,68 @@ async def level(ctx, member: discord.Member = None):
 
     await ctx.send(embed=embed)
 
-# ==================== ОСТАЛЬНЫЕ КОМАНДЫ (БЕЗ ИЗМЕНЕНИЙ) ====================
+@bot.command(name="график", aliases=["graph", "activity"])
+async def activity_graph(ctx, member: discord.Member = None):
+    """Показывает график активности пользователя за последние 30 дней"""
+    if member is None:
+        member = ctx.author
+
+    async with ctx.typing():
+        history = await db.get_user_history(member.id, ctx.guild.id, 30)
+
+        if not history:
+            await ctx.send(f"❌ У {member.mention} недостаточно данных для построения графика.")
+            return
+
+        history.reverse()
+        dates = [row['date'].strftime('%d.%m') for row in history]
+        voice_data = [row['voice_minutes'] / 60 for row in history]
+        msg_data = [row['messages'] for row in history]
+
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
+        fig.suptitle(f'Активность {member.display_name} (последние 30 дней)', fontsize=16)
+
+        bars1 = ax1.bar(dates, voice_data, color='#3498db', alpha=0.8, edgecolor='black', linewidth=0.5)
+        ax1.set_ylabel('Часы в голосе', fontsize=12)
+        ax1.set_title('🎤 Голосовая активность', fontsize=14, pad=10)
+        ax1.grid(axis='y', alpha=0.3)
+        for bar, value in zip(bars1, voice_data):
+            if value > 0:
+                ax1.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.1,
+                        f'{value:.1f}', ha='center', va='bottom', fontsize=8)
+
+        bars2 = ax2.bar(dates, msg_data, color='#2ecc71', alpha=0.8, edgecolor='black', linewidth=0.5)
+        ax2.set_ylabel('Сообщения', fontsize=12)
+        ax2.set_xlabel('Дата', fontsize=12)
+        ax2.set_title('💬 Сообщения', fontsize=14, pad=10)
+        ax2.grid(axis='y', alpha=0.3)
+        for bar, value in zip(bars2, msg_data):
+            if value > 0:
+                ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.5,
+                        f'{value}', ha='center', va='bottom', fontsize=8)
+
+        plt.setp(ax1.xaxis.get_majorticklabels(), rotation=45, ha='right')
+        plt.setp(ax2.xaxis.get_majorticklabels(), rotation=45, ha='right')
+
+        plt.tight_layout()
+
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', dpi=120, bbox_inches='tight')
+        buf.seek(0)
+        plt.close()
+
+        file = discord.File(buf, filename='activity.png')
+        embed = discord.Embed(
+            title=f"📈 График активности {member.display_name}",
+            color=discord.Color.blue(),
+            timestamp=get_moscow_time()
+        )
+        embed.set_image(url="attachment://activity.png")
+        embed.set_footer(text=f"Запросил: {ctx.author.display_name} • Время МСК")
+
+    await ctx.send(embed=embed, file=file)
+
+# ==================== ОСТАЛЬНЫЕ КОМАНДЫ ====================
 @bot.command(name="логи")
 @commands.has_permissions(administrator=True)
 async def logs(ctx, target_channel: discord.TextChannel = None):
@@ -1500,7 +1658,7 @@ async def help_command(ctx):
         name="👤 **Для всех**",
         value="`!статистика` - ваша статистика\n`!статистика @пользователь` - статистика пользователя\n"
               "`!топ` - топ пользователей\n`!уровень` - ваш уровень и опыт\n"
-              "`!помощь` - это сообщение",
+              "`!график` - график активности за 30 дней\n`!помощь` - это сообщение",
         inline=False
     )
     embed.add_field(
@@ -1551,10 +1709,9 @@ def run_flask():
 if __name__ == "__main__":
     print("=" * 60)
     print("🤖 Discord Voice Activity Bot")
-    print("📱 Версия: 8.0 (PostgreSQL + Guild Config + Warns + Weekly Top + LEVELS)")
+    print("📱 Версия: 10.0 (PostgreSQL + Levels + Level Roles + Graphs + Warns + Weekly Top)")
     print("⏰ Часовой пояс: Московское время (GMT+3)")
-    print("📊 Система ролей: голосовая активность")
-    print("📈 Система уровней: опыт за сообщения и голос")
+    print("📈 Система уровней и ролей за уровень")
     print("📝 Логирование: все события (сохраняется в БД)")
     print(f"📱 Telegram: {'✅ ПОДКЛЮЧЕН (команды: /stats, /top, /roles, /help)' if telegram.enabled else '❌ НЕ НАСТРОЕН'}")
     print("=" * 60)
