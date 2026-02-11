@@ -106,11 +106,11 @@ class Database:
             )
             
     async def get_total_users(self):
-    pool = await self.connect()
-    async with pool.acquire() as conn:
-        row = await conn.fetchval("SELECT COUNT(*) FROM users")
-        return row
-
+        pool = await self.connect()
+        async with pool.acquire() as conn:
+            row = await conn.fetchval("SELECT COUNT(*) FROM users")
+            return row
+    
     async def get_total_stats(self):
         pool = await self.connect()
         async with pool.acquire() as conn:
