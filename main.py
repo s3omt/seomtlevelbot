@@ -87,7 +87,9 @@ class Storage:
             "channel_events": True,
             "server_events": True,
             "message_events": False,
-            "command_events": True
+            "command_events": True,
+            "telegram_notify_role": False,
+            "telegram_daily_report": True
         }
         self.load_data()
 
@@ -156,7 +158,7 @@ class Storage:
 
 storage = Storage()
 
-# ==================== TELEGRAM БОТ ====================
+# ==================== TELEGRAM БОТ (С ПОЛЛИНГОМ) ====================
 class TelegramBot:
     def __init__(self, token: str, chat_id: str):
         self.token = token
@@ -164,15 +166,15 @@ class TelegramBot:
         self.base_url = f"https://api.telegram.org/bot{token}"
         self.enabled = bool(token and chat_id)
         self.session = None
-    
+        self.polling_task = None
+
     async def ensure_session(self):
-        if self.session is None:
+        if self.session is None and self.enabled:
             self.session = aiohttp.ClientSession()
-    
+
     async def send_message(self, text: str) -> bool:
         if not self.enabled:
             return False
-        
         try:
             await self.ensure_session()
             payload = {
@@ -183,26 +185,24 @@ class TelegramBot:
             async with self.session.post(f"{self.base_url}/sendMessage", json=payload) as resp:
                 return resp.status == 200
         except Exception as e:
-            print(f"❌ Telegram ошибка: {e}")
+            print(f"❌ Telegram send error: {e}")
             return False
-    
+
     async def send_stats(self) -> bool:
         if not self.enabled:
             return False
-        
         total_users = len(storage.voice_time)
         total_messages = sum(storage.messages.values())
         total_voice_hours = sum(storage.voice_time.values()) // 60
         total_voice_minutes = sum(storage.voice_time.values()) % 60
-        
-        # Топ 3 пользователей
+
         voice_top = storage.get_top_users(3)[0]
         top_text = ""
         for i, (user_id, minutes) in enumerate(voice_top, 1):
             hours = minutes // 60
             mins = minutes % 60
-            top_text += f"{i}. ID `{user_id}` - {hours}ч {mins}м\n"
-        
+            top_text += f"{i}. ID `{user_id}` — {hours}ч {mins}м\n"
+
         message = f"""
 📊 *СТАТИСТИКА DISCORD БОТА*
 
@@ -215,25 +215,101 @@ class TelegramBot:
 {top_text}
 ⏰ *{format_moscow_time()}*
         """
-        
         return await self.send_message(message)
-    
+
     async def send_alert(self, title: str, description: str, alert_type: str = "info") -> bool:
         if not self.enabled:
             return False
-        
         emoji = {
-            "info": "ℹ️",
-            "success": "✅",
-            "warning": "⚠️",
-            "error": "❌",
-            "critical": "🚨"
+            "info": "ℹ️", "success": "✅", "warning": "⚠️",
+            "error": "❌", "critical": "🚨"
         }.get(alert_type, "📝")
-        
         message = f"{emoji} *{title}*\n\n{description}\n\n⏰ {format_moscow_time()}"
         return await self.send_message(message)
-    
+
+    # ========== ПОЛЛИНГ КОМАНД ==========
+    async def start_polling(self):
+        if not self.enabled:
+            return
+        self.polling_task = asyncio.create_task(self._polling_loop())
+        print("📱 Telegram polling запущен")
+
+    async def _polling_loop(self):
+        offset = 0
+        await self.ensure_session()
+        while True:
+            try:
+                params = {"offset": offset + 1, "timeout": 30}
+                async with self.session.get(f"{self.base_url}/getUpdates", params=params) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        for update in data.get("result", []):
+                            offset = update["update_id"]
+                            await self._process_update(update)
+                await asyncio.sleep(1)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                print(f"❌ Telegram polling error: {e}")
+                await asyncio.sleep(5)
+
+    async def _process_update(self, update):
+        if "message" not in update:
+            return
+        msg = update["message"]
+        chat_id = msg["chat"]["id"]
+        if str(chat_id) != self.chat_id:
+            return
+        if "text" not in msg:
+            return
+        text = msg["text"].strip()
+
+        if text == "/start":
+            await self.send_message(
+                "🤖 *Discord Bot Telegram Monitor*\n\n"
+                "Доступные команды:\n"
+                "• `/stats` — статистика бота\n"
+                "• `/top` — топ пользователей\n"
+                "• `/roles` — список ролей\n"
+                "• `/help` — помощь"
+            )
+        elif text == "/stats":
+            await self.send_stats()
+        elif text == "/top":
+            voice_top, msg_top = storage.get_top_users(5)
+            text_lines = ["🏆 *Топ по голосовой активности:*"]
+            for i, (uid, minutes) in enumerate(voice_top, 1):
+                text_lines.append(f"{i}. ID `{uid}` — {minutes//60}ч {minutes%60}м")
+            text_lines.append("\n💬 *Топ по сообщениям:*")
+            for i, (uid, count) in enumerate(msg_top, 1):
+                text_lines.append(f"{i}. ID `{uid}` — {count} сообщ.")
+            await self.send_message("\n".join(text_lines))
+        elif text == "/roles":
+            lines = ["🎖️ *Роли за голосовую активность:*\n"]
+            for role in ROLE_ORDER:
+                minutes = ROLES_CONFIG[role]["voice_minutes"]
+                lines.append(f"**{role}** — {minutes//60}ч {minutes%60}м")
+            await self.send_message("\n".join(lines))
+        elif text == "/help":
+            await self.send_message(
+                "📚 *Команды Telegram:*\n\n"
+                "`/stats` — статистика бота\n"
+                "`/top` — топ пользователей\n"
+                "`/roles` — список ролей\n"
+                "`/help` — это сообщение"
+            )
+
+    async def stop_polling(self):
+        if self.polling_task:
+            self.polling_task.cancel()
+            try:
+                await self.polling_task
+            except asyncio.CancelledError:
+                pass
+            self.polling_task = None
+
     async def close(self):
+        await self.stop_polling()
         if self.session:
             await self.session.close()
 
@@ -248,32 +324,22 @@ class Logger:
         try:
             if not storage.log_channel:
                 return
-
             log_channel = guild.get_channel(int(storage.log_channel))
             if not log_channel:
                 return
 
-            # Проверяем конфигурацию
             config_keys = {
-                "voice": "voice_events",
-                "role": "role_events",
-                "member": "member_events",
-                "channel": "channel_events",
-                "server": "server_events",
-                "message": "message_events",
+                "voice": "voice_events", "role": "role_events",
+                "member": "member_events", "channel": "channel_events",
+                "server": "server_events", "message": "message_events",
                 "command": "command_events"
             }
-            
             if event_type in config_keys and not storage.log_config.get(config_keys[event_type], True):
                 return
 
             color_map = {
-                "voice": 0x3498db,
-                "role": 0x2ecc71,
-                "member": 0xe67e22,
-                "channel": 0x9b59b6,
-                "server": 0xe74c3c,
-                "command": 0x1abc9c,
+                "voice": 0x3498db, "role": 0x2ecc71, "member": 0xe67e22,
+                "channel": 0x9b59b6, "server": 0xe74c3c, "command": 0x1abc9c,
                 "message": 0x95a5a6
             }
 
@@ -307,7 +373,7 @@ class Logger:
                 for name, value in fields.items():
                     embed.add_field(name=name, value=str(value), inline=False)
 
-            embed.set_footer(text=f"Время МСК")
+            embed.set_footer(text="Время МСК")
             await log_channel.send(embed=embed)
 
         except Exception as e:
@@ -327,7 +393,6 @@ class RoleManager:
         role = discord.utils.get(guild.roles, name=role_name)
         if role:
             return role
-
         try:
             color = ROLE_COLORS.get(role_name, 0x9E9E9E)
             role = await guild.create_role(
@@ -338,7 +403,6 @@ class RoleManager:
                 reason="Автоматическое создание роли"
             )
             print(f"✅ Создана роль {role_name} на {guild.name}")
-            
             await Logger.log_event(
                 guild=guild,
                 event_type="role",
@@ -355,20 +419,16 @@ class RoleManager:
     @staticmethod
     async def give_default_role(member: discord.Member):
         try:
-            # Проверяем, есть ли уже роль из системы
             for role_name in ROLES_CONFIG.keys():
                 role = discord.utils.get(member.guild.roles, name=role_name)
                 if role and role in member.roles:
                     return
-
             role = discord.utils.get(member.guild.roles, name="Залётный")
             if not role:
                 role = await RoleManager.ensure_role_exists(member.guild, "Залётный")
-            
             if role and role not in member.roles and await RoleManager.check_hierarchy(member.guild, role):
                 await member.add_roles(role, reason="Начальная роль")
                 print(f"✅ Выдана роль Залётный {member}")
-                
                 await Logger.log_event(
                     guild=member.guild,
                     event_type="role",
@@ -386,7 +446,6 @@ class RoleManager:
             user_id = str(member.id)
             voice_minutes = storage.voice_time.get(user_id, 0)
 
-            # Определяем заслуженную роль
             earned_role_name = "Залётный"
             for role_name in reversed(ROLE_ORDER):
                 if voice_minutes >= ROLES_CONFIG[role_name]["voice_minutes"]:
@@ -399,26 +458,21 @@ class RoleManager:
 
             if not earned_role or earned_role in member.roles:
                 return
-
             if not await RoleManager.check_hierarchy(member.guild, earned_role):
                 return
 
-            # Удаляем старые роли
             roles_to_remove = []
             for role_name in ROLES_CONFIG.keys():
                 if role_name != earned_role_name:
                     old_role = discord.utils.get(member.guild.roles, name=role_name)
                     if old_role and old_role in member.roles:
                         roles_to_remove.append(old_role)
-            
             if roles_to_remove:
                 await member.remove_roles(*roles_to_remove, reason="Обновление роли")
 
-            # Выдаем новую роль
             await member.add_roles(earned_role, reason=f"Голос: {voice_minutes} мин")
             print(f"✅ {member} получил роль {earned_role_name} ({voice_minutes} мин)")
-            
-            # Логируем
+
             await Logger.log_event(
                 guild=member.guild,
                 event_type="role",
@@ -428,8 +482,7 @@ class RoleManager:
                 user=member,
                 fields={"Голосовая активность": f"{voice_minutes // 60}ч {voice_minutes % 60}м"}
             )
-            
-            # Отправляем уведомление в Telegram
+
             if telegram.enabled and storage.log_config.get("telegram_notify_role", False):
                 await telegram.send_alert(
                     "🎉 Новая роль",
@@ -445,13 +498,11 @@ class RoleManager:
 # ==================== ЗАДАЧИ ====================
 @tasks.loop(minutes=5)
 async def check_voice_time():
-    """Проверка голосового времени каждые 5 минут"""
     try:
         now = datetime.datetime.now(datetime.timezone.utc)
         for user_id, session_start in list(storage.voice_sessions.items()):
             duration = (now - session_start).total_seconds() / 60
             member_id = int(user_id)
-            
             for guild in bot.guilds:
                 member = guild.get_member(member_id)
                 if member and member.voice and member.voice.channel:
@@ -464,7 +515,6 @@ async def check_voice_time():
 
 @tasks.loop(hours=24)
 async def daily_report():
-    """Ежедневный отчет в Telegram"""
     try:
         if telegram.enabled and storage.log_config.get("telegram_daily_report", True):
             await telegram.send_stats()
@@ -479,8 +529,8 @@ async def on_ready():
     print(f"📊 Серверов: {len(bot.guilds)}")
     print(f"🐍 Python: {sys.version}")
     print(f"📱 Telegram: {'✅' if telegram.enabled else '❌'}")
-    
-    # Очищаем старые слэш-команды
+
+    # Очистка старых слэш-команд
     try:
         bot.tree.clear_commands(guild=None)
         await bot.tree.sync()
@@ -490,23 +540,24 @@ async def on_ready():
         print("🧹 Слэш-команды очищены")
     except Exception as e:
         print(f"⚠️ Ошибка очистки команд: {e}")
-    
-    # Запускаем задачи
+
+    # Запуск задач
     if not check_voice_time.is_running():
         check_voice_time.start()
         print("⏱️ Запущена проверка голосового времени")
-    
     if telegram.enabled and not daily_report.is_running():
         daily_report.start()
         print("📊 Запущен ежедневный отчет в Telegram")
-    
-    # Создаем роли на всех серверах
+    if telegram.enabled:
+        await telegram.start_polling()
+
+    # Создание ролей
     for guild in bot.guilds:
         print(f"\n🔍 Сервер: {guild.name}")
         for role_name in ROLES_CONFIG.keys():
             await RoleManager.ensure_role_exists(guild, role_name)
-    
-    # Выдаем начальные роли
+
+    # Выдача начальных ролей
     print("\n🎯 Выдача начальных ролей...")
     for guild in bot.guilds:
         members = [m for m in guild.members if not m.bot]
@@ -514,10 +565,9 @@ async def on_ready():
         for member in members:
             await RoleManager.give_default_role(member)
             await asyncio.sleep(0.05)
-    
     print("✅ Начальная выдача ролей завершена!")
-    
-    # Логируем запуск
+
+    # Логирование запуска
     for guild in bot.guilds:
         await Logger.log_event(
             guild=guild,
@@ -531,8 +581,7 @@ async def on_ready():
                 "Время (МСК)": format_moscow_time()
             }
         )
-    
-    # Отправляем в Telegram
+
     if telegram.enabled:
         await telegram.send_alert(
             "🤖 Бот запущен",
@@ -547,10 +596,8 @@ async def on_ready():
 async def on_member_join(member: discord.Member):
     if member.bot:
         return
-    
     print(f"👤 Новый участник: {member}")
     await RoleManager.give_default_role(member)
-    
     await Logger.log_event(
         guild=member.guild,
         event_type="member",
@@ -568,9 +615,7 @@ async def on_member_join(member: discord.Member):
 async def on_member_remove(member: discord.Member):
     if member.bot:
         return
-    
     print(f"👋 Участник вышел: {member}")
-    
     await Logger.log_event(
         guild=member.guild,
         event_type="member",
@@ -588,8 +633,6 @@ async def on_member_remove(member: discord.Member):
 async def on_member_update(before: discord.Member, after: discord.Member):
     if after.bot:
         return
-    
-    # Изменение ника
     if before.display_name != after.display_name:
         await Logger.log_event(
             guild=after.guild,
@@ -608,19 +651,16 @@ async def on_member_update(before: discord.Member, after: discord.Member):
 async def on_message(message):
     if message.author.bot:
         return
-    
     if not message.content.startswith('!'):
         storage.add_message(message.author.id)
         if isinstance(message.author, discord.Member):
             await RoleManager.check_and_give_roles(message.author)
-    
     await bot.process_commands(message)
 
 @bot.event
 async def on_message_delete(message: discord.Message):
     if message.author.bot:
         return
-    
     if storage.log_config.get("message_events", False):
         await Logger.log_event(
             guild=message.guild,
@@ -640,7 +680,6 @@ async def on_message_delete(message: discord.Message):
 async def on_message_edit(before: discord.Message, after: discord.Message):
     if before.author.bot or before.content == after.content:
         return
-    
     if storage.log_config.get("message_events", False):
         await Logger.log_event(
             guild=before.guild,
@@ -661,15 +700,12 @@ async def on_message_edit(before: discord.Message, after: discord.Message):
 async def on_voice_state_update(member, before, after):
     if member.bot:
         return
-    
     user_id = str(member.id)
     now = datetime.datetime.now(datetime.timezone.utc)
-    
-    # Зашел в голосовой
+
     if before.channel is None and after.channel is not None:
         storage.voice_sessions[user_id] = now
         print(f"🎤 {member} зашел в {after.channel.name}")
-        
         if storage.log_config.get("voice_events", True):
             await Logger.log_event(
                 guild=member.guild,
@@ -684,15 +720,13 @@ async def on_voice_state_update(member, before, after):
                     "Время": format_moscow_time()
                 }
             )
-    
-    # Вышел из голосового
+
     elif before.channel is not None and after.channel is None:
         if user_id in storage.voice_sessions:
             duration = (now - storage.voice_sessions[user_id]).total_seconds() / 60
             if duration >= 1:
                 storage.add_voice_time(member.id, int(duration))
                 await RoleManager.check_and_give_roles(member)
-                
                 if storage.log_config.get("voice_events", True):
                     await Logger.log_event(
                         guild=member.guild,
@@ -709,15 +743,13 @@ async def on_voice_state_update(member, before, after):
                         }
                     )
             del storage.voice_sessions[user_id]
-    
-    # Переход между каналами
+
     elif before.channel is not None and after.channel is not None and before.channel != after.channel:
         if user_id in storage.voice_sessions:
             duration = (now - storage.voice_sessions[user_id]).total_seconds() / 60
             if duration >= 1:
                 storage.add_voice_time(member.id, int(duration))
             storage.voice_sessions[user_id] = now
-            
             if storage.log_config.get("voice_events", True):
                 await Logger.log_event(
                     guild=member.guild,
@@ -736,7 +768,6 @@ async def on_voice_state_update(member, before, after):
 
 @bot.event
 async def on_guild_channel_create(channel: discord.abc.GuildChannel):
-    """Создание канала"""
     await Logger.log_event(
         guild=channel.guild,
         event_type="channel",
@@ -753,7 +784,6 @@ async def on_guild_channel_create(channel: discord.abc.GuildChannel):
 
 @bot.event
 async def on_guild_channel_delete(channel: discord.abc.GuildChannel):
-    """Удаление канала"""
     await Logger.log_event(
         guild=channel.guild,
         event_type="channel",
@@ -768,115 +798,84 @@ async def on_guild_channel_delete(channel: discord.abc.GuildChannel):
     )
 
 # ==================== КОМАНДЫ DISCORD ====================
-
 @bot.command(name="статистика")
 async def stats(ctx, member: discord.Member = None):
-    """Показать статистику пользователя"""
     if not member:
         member = ctx.author
-    
-    stats_data = storage.get_user_stats(member.id)
-    
+    data = storage.get_user_stats(member.id)
+
     embed = discord.Embed(
         title=f"📊 Статистика {member.display_name}",
         color=discord.Color.blue(),
         timestamp=get_moscow_time()
     )
-    
     embed.add_field(
         name="🎤 Голосовая активность",
-        value=f"**{stats_data['voice_hours']}ч {stats_data['voice_remaining_minutes']}м**\nВсего: {stats_data['voice_minutes']} минут",
+        value=f"**{data['voice_hours']}ч {data['voice_remaining_minutes']}м**\nВсего: {data['voice_minutes']} минут",
         inline=True
     )
-    
     embed.add_field(
         name="💬 Сообщений",
-        value=f"**{stats_data['messages']}**",
+        value=f"**{data['messages']}**",
         inline=True
     )
-    
-    # Текущая роль
+
     current_role = "Залётный"
     for role_name in reversed(ROLE_ORDER):
-        if stats_data['voice_minutes'] >= ROLES_CONFIG[role_name]["voice_minutes"]:
+        if data['voice_minutes'] >= ROLES_CONFIG[role_name]["voice_minutes"]:
             current_role = role_name
             break
-    
-    embed.add_field(
-        name="👑 Текущая роль",
-        value=f"**{current_role}**",
-        inline=False
-    )
-    
-    # Прогресс до следующей роли
+    embed.add_field(name="👑 Текущая роль", value=f"**{current_role}**", inline=False)
+
     current_index = ROLE_ORDER.index(current_role)
     if current_index < len(ROLE_ORDER) - 1:
         next_role = ROLE_ORDER[current_index + 1]
         required = ROLES_CONFIG[next_role]["voice_minutes"]
-        remaining = max(0, required - stats_data['voice_minutes'])
-        progress = (stats_data['voice_minutes'] / required) * 100 if required > 0 else 0
-        
+        remaining = max(0, required - data['voice_minutes'])
+        progress = (data['voice_minutes'] / required) * 100 if required > 0 else 0
         embed.add_field(
             name=f"🎯 До {next_role}",
             value=f"Осталось: **{remaining // 60}ч {remaining % 60}м**\nПрогресс: `{progress:.1f}%`",
             inline=False
         )
-    
+
     embed.set_thumbnail(url=member.display_avatar.url)
     embed.set_footer(text=f"ID: {member.id} • Время МСК")
-    
     await ctx.send(embed=embed)
 
 @bot.command(name="топ")
 async def top(ctx):
-    """Топ пользователей по активности"""
     voice_top, messages_top = storage.get_top_users(10)
-    
+
     embed = discord.Embed(
         title="🏆 Топ активности",
         color=discord.Color.gold(),
         timestamp=get_moscow_time()
     )
-    
-    # Топ голоса
+
     voice_text = ""
-    for i, (user_id, minutes) in enumerate(voice_top[:5], 1):
-        user = ctx.guild.get_member(user_id)
-        name = user.display_name if user else f"ID: {user_id}"
-        voice_text += f"{i}. **{name}** - {minutes // 60}ч {minutes % 60}м\n"
-    
-    embed.add_field(
-        name="🎤 Голосовая активность (Топ 5)",
-        value=voice_text or "Нет данных",
-        inline=False
-    )
-    
-    # Топ сообщений
-    messages_text = ""
-    for i, (user_id, count) in enumerate(messages_top[:5], 1):
-        user = ctx.guild.get_member(user_id)
-        name = user.display_name if user else f"ID: {user_id}"
-        messages_text += f"{i}. **{name}** - {count} сообщ.\n"
-    
-    embed.add_field(
-        name="💬 Сообщения (Топ 5)",
-        value=messages_text or "Нет данных",
-        inline=False
-    )
-    
+    for i, (uid, minutes) in enumerate(voice_top[:5], 1):
+        user = ctx.guild.get_member(uid)
+        name = user.display_name if user else f"ID: {uid}"
+        voice_text += f"{i}. **{name}** — {minutes // 60}ч {minutes % 60}м\n"
+    embed.add_field(name="🎤 Голос (Топ 5)", value=voice_text or "Нет данных", inline=False)
+
+    msg_text = ""
+    for i, (uid, count) in enumerate(messages_top[:5], 1):
+        user = ctx.guild.get_member(uid)
+        name = user.display_name if user else f"ID: {uid}"
+        msg_text += f"{i}. **{name}** — {count} сообщ.\n"
+    embed.add_field(name="💬 Сообщения (Топ 5)", value=msg_text or "Нет данных", inline=False)
+
     embed.set_footer(text=f"Всего в базе: {len(storage.voice_time)} пользователей • Время МСК")
-    
     await ctx.send(embed=embed)
 
 @bot.command(name="логи")
 @commands.has_permissions(administrator=True)
 async def logs(ctx, channel: discord.TextChannel = None):
-    """Управление системой логирования"""
-    
     if channel:
         storage.log_channel = str(channel.id)
         storage.save_data()
-        
         embed = discord.Embed(
             title="✅ Лог-канал установлен",
             description=f"Лог-канал: {channel.mention}",
@@ -884,7 +883,6 @@ async def logs(ctx, channel: discord.TextChannel = None):
             timestamp=get_moscow_time()
         )
         await ctx.send(embed=embed)
-        
         await Logger.log_event(
             guild=ctx.guild,
             event_type="server",
@@ -900,7 +898,6 @@ async def logs(ctx, channel: discord.TextChannel = None):
             color=discord.Color.purple(),
             timestamp=get_moscow_time()
         )
-        
         if storage.log_channel:
             ch = ctx.guild.get_channel(int(storage.log_channel))
             if ch:
@@ -909,12 +906,11 @@ async def logs(ctx, channel: discord.TextChannel = None):
                 embed.add_field(name="⚠️ Лог-канал не найден", value=f"ID: {storage.log_channel}", inline=False)
         else:
             embed.add_field(name="❌ Лог-канал не установлен", value="Используйте `!логи #канал`", inline=False)
-        
+
         config_text = ""
         for key, value in storage.log_config.items():
             if not key.startswith("telegram"):
                 config_text += f"• **{key.replace('_', ' ').title()}:** {'✅' if value else '❌'}\n"
-        
         embed.add_field(name="⚙️ Конфигурация", value=config_text, inline=False)
         embed.set_footer(text="Используйте !настройки_логов для детальной настройки")
         await ctx.send(embed=embed)
@@ -922,11 +918,9 @@ async def logs(ctx, channel: discord.TextChannel = None):
 @bot.command(name="тест_лога")
 @commands.has_permissions(administrator=True)
 async def test_log(ctx):
-    """Тестирование системы логирования"""
     if not storage.log_channel:
         await ctx.send("❌ Лог-канал не установлен! Используйте `!логи #канал`")
         return
-    
     await Logger.log_event(
         guild=ctx.guild,
         event_type="server",
@@ -939,28 +933,23 @@ async def test_log(ctx):
             "Время": format_moscow_time()
         }
     )
-    
     await ctx.send("✅ Тестовое сообщение отправлено!")
 
 @bot.command(name="настройки_логов")
 @commands.has_permissions(administrator=True)
 async def log_settings(ctx, event_type: str = None, status: str = None):
-    """Настройка типов событий для логирования"""
-    
     if not event_type:
         embed = discord.Embed(
             title="⚙️ Настройки логирования",
             color=discord.Color.blue(),
             timestamp=get_moscow_time()
         )
-        
         config_text = ""
         for key, value in storage.log_config.items():
             if key.startswith("telegram"):
                 config_text += f"• **{key.replace('_', ' ').title()}:** {'✅' if value else '❌'}\n"
             else:
                 config_text += f"• **{key}:** {'✅ Вкл' if value else '❌ Выкл'}\n"
-        
         embed.add_field(name="Текущие настройки", value=config_text, inline=False)
         embed.add_field(
             name="📝 Доступные типы",
@@ -970,25 +959,20 @@ async def log_settings(ctx, event_type: str = None, status: str = None):
         embed.set_footer(text="Используйте: !настройки_логов [тип] [on/off]")
         await ctx.send(embed=embed)
         return
-    
+
     if event_type not in storage.log_config:
         await ctx.send(f"❌ Неизвестный тип события: {event_type}")
         return
-    
     if not status or status.lower() not in ['on', 'off']:
         await ctx.send(f"❌ Укажите on или off")
         return
-    
     storage.log_config[event_type] = (status.lower() == 'on')
     storage.save_data()
-    
     await ctx.send(f"✅ {event_type} теперь {'включен' if storage.log_config[event_type] else 'выключен'}")
 
 @bot.command(name="telegram")
 @commands.has_permissions(administrator=True)
 async def telegram_cmd(ctx, action: str = None):
-    """Управление Telegram уведомлениями"""
-    
     if not telegram.enabled:
         embed = discord.Embed(
             title="❌ Telegram не настроен",
@@ -997,34 +981,24 @@ async def telegram_cmd(ctx, action: str = None):
         )
         await ctx.send(embed=embed)
         return
-    
+
     if not action:
         embed = discord.Embed(
             title="📱 Telegram уведомления",
             color=discord.Color.blue(),
             timestamp=get_moscow_time()
         )
-        
-        # Добавляем настройки если их нет
-        if "telegram_notify_role" not in storage.log_config:
-            storage.log_config["telegram_notify_role"] = False
-        if "telegram_daily_report" not in storage.log_config:
-            storage.log_config["telegram_daily_report"] = True
-        storage.save_data()
-        
         embed.add_field(
             name="Статус",
             value=f"✅ Подключен к чату ID: `{TELEGRAM_CHAT_ID}`",
             inline=False
         )
-        
         embed.add_field(
             name="Настройки",
             value=f"• Уведомления о ролях: {'✅' if storage.log_config.get('telegram_notify_role', False) else '❌'}\n"
                   f"• Ежедневный отчет: {'✅' if storage.log_config.get('telegram_daily_report', True) else '❌'}",
             inline=False
         )
-        
         embed.add_field(
             name="Команды",
             value="`!telegram on` - включить уведомления о ролях\n"
@@ -1033,25 +1007,20 @@ async def telegram_cmd(ctx, action: str = None):
                   "`!telegram test` - отправить тестовое сообщение",
             inline=False
         )
-        
         await ctx.send(embed=embed)
-    
     elif action == "on":
         storage.log_config["telegram_notify_role"] = True
         storage.save_data()
         await ctx.send("✅ Уведомления о новых ролях **включены**")
-        
     elif action == "off":
         storage.log_config["telegram_notify_role"] = False
         storage.save_data()
         await ctx.send("❌ Уведомления о новых ролях **выключены**")
-        
     elif action == "daily":
         current = storage.log_config.get("telegram_daily_report", True)
         storage.log_config["telegram_daily_report"] = not current
         storage.save_data()
         await ctx.send(f"✅ Ежедневный отчет {'включен' if not current else 'выключен'}")
-        
     elif action == "test":
         success = await telegram.send_alert(
             "🧪 Тестовое уведомление",
@@ -1066,7 +1035,6 @@ async def telegram_cmd(ctx, action: str = None):
 @bot.command(name="очистить_команды")
 @commands.has_permissions(administrator=True)
 async def clear_commands(ctx):
-    """Очищает старые слэш-команды"""
     try:
         bot.tree.clear_commands(guild=None)
         await bot.tree.sync()
@@ -1078,56 +1046,32 @@ async def clear_commands(ctx):
 
 @bot.command(name="помощь")
 async def help_command(ctx):
-    """Показать список команд"""
-    
     embed = discord.Embed(
         title="📚 Команды бота",
         description=f"Префикс: `{bot.command_prefix}`",
         color=discord.Color.green(),
         timestamp=get_moscow_time()
     )
-    
     embed.add_field(
         name="👤 **Для всех**",
-        value="""
-`!статистика` - ваша статистика
-`!статистика @пользователь` - статистика пользователя
-`!топ` - топ пользователей
-`!помощь` - это сообщение
-        """,
+        value="`!статистика` - ваша статистика\n`!статистика @пользователь` - статистика пользователя\n`!топ` - топ пользователей\n`!помощь` - это сообщение",
         inline=False
     )
-    
     embed.add_field(
         name="👑 **Для администраторов**",
-        value="""
-`!логи` - статус лог-канала
-`!логи #канал` - установить канал для логов
-`!тест_лога` - тест системы логирования
-`!настройки_логов` - показать настройки
-`!настройки_логов [тип] [on/off]` - изменить настройки
-`!telegram` - управление Telegram уведомлениями
-`!очистить_команды` - удалить старые слэш-команды
-        """,
+        value="`!логи` - статус лог-канала\n`!логи #канал` - установить канал для логов\n`!тест_лога` - тест системы логирования\n"
+              "`!настройки_логов` - показать настройки\n`!настройки_логов [тип] [on/off]` - изменить настройки\n"
+              "`!telegram` - управление Telegram уведомлениями\n`!очистить_команды` - удалить старые слэш-команды",
         inline=False
     )
-    
     embed.add_field(
         name="⚙️ **Типы событий**",
-        value="""
-`voice_events` - голосовая активность
-`role_events` - события ролей
-`member_events` - вход/выход участников
-`channel_events` - создание/удаление каналов
-`server_events` - изменения сервера
-`message_events` - удаление/редактирование сообщений
-`command_events` - использование команд
-        """,
+        value="`voice_events` - голосовая активность\n`role_events` - события ролей\n`member_events` - вход/выход участников\n"
+              "`channel_events` - создание/удаление каналов\n`server_events` - изменения сервера\n"
+              "`message_events` - удаление/редактирование сообщений\n`command_events` - использование команд",
         inline=False
     )
-    
     embed.set_footer(text=f"Бот: {bot.user.name} • Время МСК")
-    
     await ctx.send(embed=embed)
 
 # ==================== FLASK ДЛЯ UPTIMEROBOT ====================
@@ -1155,19 +1099,17 @@ def run_flask():
 if __name__ == "__main__":
     print("=" * 60)
     print("🤖 Discord Voice Activity Bot")
-    print("📱 Версия: 5.0 (ПОЛНЫЙ ФУНКЦИОНАЛ)")
+    print("📱 Версия: 5.0 (ПОЛНЫЙ ФУНКЦИОНАЛ + TELEGRAM КОМАНДЫ)")
     print("⏰ Часовой пояс: Московское время (GMT+3)")
     print("📊 Система ролей: голосовая активность")
     print("📝 Логирование: все события")
-    print(f"📱 Telegram: {'✅ ПОДКЛЮЧЕН' if telegram.enabled else '❌ НЕ НАСТРОЕН'}")
+    print(f"📱 Telegram: {'✅ ПОДКЛЮЧЕН (команды: /stats, /top, /roles, /help)' if telegram.enabled else '❌ НЕ НАСТРОЕН'}")
     print("=" * 60)
-    
-    # Запускаем Flask
+
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
     print("🌐 Веб-сервер запущен")
-    
-    # Запускаем бота
+
     try:
         bot.run(TOKEN)
     except KeyboardInterrupt:
@@ -1175,5 +1117,4 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"❌ Ошибка запуска: {e}")
     finally:
-        # Закрываем соединения
         asyncio.run(telegram.close())
