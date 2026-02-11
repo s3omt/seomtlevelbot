@@ -1826,36 +1826,41 @@ async def activity_graph(ctx, member: discord.Member = None):
 
 @bot.command(name="профиль", aliases=["rank", "карточка", "profile"])
 async def profile(ctx, member: discord.Member = None):
-    """Показывает карточку профиля пользователя с уровнем, монетами и достижениями"""
+    """Показывает красивую карточку профиля"""
     if member is None:
         member = ctx.author
 
     async with ctx.typing():
-        # Получаем данные
+        # Получаем все данные
         level_info = await db.get_level_info(member.id)
         balance = await db.get_balance(member.id)
         stats = await db.get_user_stats(member.id)
         achievements = await db.get_user_achievements(member.id)
+        profile_settings = await db.get_user_profile(member.id)
+        theme = await db.get_theme_by_id(profile_settings['theme_id'])
+        if not theme:
+            theme = await db.get_theme_by_id(1)  # Классическая
 
-        # Определяем текущую роль
+        # Текущая роль
         current_role = DEFAULT_ROLE_NAME
         for threshold in sorted(LEVEL_ROLES.keys(), reverse=True):
             if level_info['level'] >= threshold:
                 current_role = LEVEL_ROLES[threshold]
                 break
 
-        # Загружаем аватар
+        # Аватар
         avatar_bytes = await fetch_avatar(member, 256)
 
-        # Создаём изображение
+        # Генерируем карточку
         img = await generate_profile_card(
             member=member,
             level_info=level_info,
             balance=balance,
             stats=stats,
-            achievements=achievements[:3],  # последние 3
+            achievements=achievements[:3],
             current_role=current_role,
-            avatar_bytes=avatar_bytes
+            avatar_bytes=avatar_bytes,
+            theme=theme
         )
 
         # Отправляем
@@ -1865,7 +1870,8 @@ async def profile(ctx, member: discord.Member = None):
             file = discord.File(buf, filename='profile.png')
             embed = discord.Embed(
                 title=f"🖼️ Профиль {member.display_name}",
-                color=discord.Color.purple(),
+                description=f"Тема: **{theme['name']}**",
+                color=theme['accent_color'],
                 timestamp=get_moscow_time()
             )
             embed.set_image(url="attachment://profile.png")
@@ -2586,160 +2592,151 @@ async def on_command_error(ctx, error):
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 import textwrap
 
-async def generate_profile_card(member, level_info, balance, stats, achievements, current_role, avatar_bytes):
-    """Генерирует красивую карточку профиля"""
-    # Размеры
-    W, H = 800, 400
-    BG_COLOR = (30, 30, 40, 255)  # тёмно-серый
-    CARD_COLOR = (20, 20, 30, 230)  # почти чёрный с прозрачностью
-    ACCENT_COLOR = (255, 215, 0)  # золотой
+async def generate_profile_card(member, level_info, balance, stats, achievements, current_role, avatar_bytes, theme):
+    """Генерирует красивую, современную карточку профиля"""
+    from PIL import Image, ImageDraw, ImageFont, ImageFilter
+    import textwrap
+
+    # ========== РАЗМЕРЫ ==========
+    W, H = 900, 300
+    AVATAR_SIZE = 120
+    AVATAR_X, AVATAR_Y = 30, 30
+
+    # ========== ЦВЕТА ИЗ ТЕМЫ ==========
+    def hex_to_rgb(hex_color, alpha=255):
+        return ((hex_color >> 16) & 0xFF, (hex_color >> 8) & 0xFF, hex_color & 0xFF, alpha)
+
+    BG_COLOR = hex_to_rgb(theme['bg_color'])
+    CARD_COLOR = hex_to_rgb(theme['card_color'], 230)
+    ACCENT_COLOR = hex_to_rgb(theme['accent_color'])[:3]  # RGB
     TEXT_COLOR = (255, 255, 255)
     SECONDARY_COLOR = (200, 200, 200)
+    PROGRESS_BG = (60, 60, 80)
+    PROGRESS_FILL = ACCENT_COLOR
 
-    # Создаём базовое изображение
+    # ========== ЗАГРУЗКА ШРИФТА ==========
+    def load_font(size, is_bold=False):
+        font_paths = [
+            "Roboto-Medium.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",   # Railway часто имеет DejaVu
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            None  # fallback — default
+        ]
+        for path in font_paths:
+            try:
+                if path:
+                    return ImageFont.truetype(path, size)
+                else:
+                    return ImageFont.load_default()
+            except:
+                continue
+        return ImageFont.load_default()
+
+    font_large = load_font(32, True)
+    font_medium = load_font(22)
+    font_small = load_font(18)
+    font_tiny = load_font(14)
+
+    # ========== СОЗДАНИЕ ПОЛОТНА ==========
     img = Image.new('RGBA', (W, H), BG_COLOR)
     draw = ImageDraw.Draw(img)
 
-    # Пытаемся загрузить шрифты, если нет — используем дефолтный
-    try:
-        font_big = ImageFont.truetype("arial.ttf", 36)
-        font_medium = ImageFont.truetype("arial.ttf", 24)
-        font_small = ImageFont.truetype("arial.ttf", 18)
-        font_tiny = ImageFont.truetype("arial.ttf", 14)
-    except:
-        font_big = ImageFont.load_default()
-        font_medium = ImageFont.load_default()
-        font_small = ImageFont.load_default()
-        font_tiny = ImageFont.load_default()
+    # ========== ФОНОВЫЙ ЭФФЕКТ (ЛЁГКИЙ ГРАДИЕНТ) ==========
+    for i in range(H):
+        alpha = int(10 * (1 - i / H))
+        draw.line([(0, i), (W, i)], fill=(*ACCENT_COLOR[:3], alpha))
 
-    # Рисуем карточку (прямоугольник со скруглёнными углами)
-    card_x, card_y, card_w, card_h = 20, 20, W-40, H-40
+    # ========== ОСНОВНАЯ КАРТОЧКА ==========
+    card_x, card_y, card_w, card_h = 15, 15, W-30, H-30
     draw.rounded_rectangle(
         [card_x, card_y, card_x+card_w, card_y+card_h],
         radius=20,
         fill=CARD_COLOR,
         outline=ACCENT_COLOR,
-        width=2
+        width=3
     )
 
-    # --- Аватар ---
+    # ========== АВАТАР ==========
     if avatar_bytes:
         try:
             avatar_img = Image.open(io.BytesIO(avatar_bytes)).convert('RGBA')
-            avatar_img = avatar_img.resize((100, 100), Image.LANCZOS)
-
-            # Маска для круглого аватара
+            avatar_img = avatar_img.resize((AVATAR_SIZE, AVATAR_SIZE), Image.LANCZOS)
+            # Круглая маска
             mask = Image.new('L', avatar_img.size, 0)
             mask_draw = ImageDraw.Draw(mask)
-            mask_draw.ellipse((0, 0, 100, 100), fill=255)
+            mask_draw.ellipse((0, 0, AVATAR_SIZE, AVATAR_SIZE), fill=255)
             avatar_img.putalpha(mask)
+            # Тень
+            shadow_offset = 3
+            shadow = Image.new('RGBA', avatar_img.size, (0,0,0,100))
+            img.paste(shadow, (AVATAR_X+shadow_offset, AVATAR_Y+shadow_offset), shadow)
+            img.paste(avatar_img, (AVATAR_X, AVATAR_Y), avatar_img)
+        except Exception as e:
+            print(f"Avatar error: {e}")
 
-            img.paste(avatar_img, (40, 40), avatar_img)
-        except:
-            pass
+    # ========== ИМЯ И ТЕГ ==========
+    name_x = AVATAR_X + AVATAR_SIZE + 20
+    draw.text((name_x, 35), member.display_name, font=font_large, fill=ACCENT_COLOR)
+    draw.text((name_x, 75), f"{member.name}#{member.discriminator}" if member.discriminator != "0" else member.name,
+              font=font_small, fill=SECONDARY_COLOR)
 
-    # --- Имя пользователя ---
-    draw.text(
-        (160, 45),
-        member.display_name,
-        font=font_big,
-        fill=ACCENT_COLOR
-    )
+    # ========== УРОВЕНЬ ==========
+    level_text = f"⚡ УРОВЕНЬ {level_info['level']}"
+    bbox = draw.textbbox((0,0), level_text, font=font_medium)
+    draw.text((W - bbox[2] - 30, 35), level_text, font=font_medium, fill=ACCENT_COLOR)
 
-    # --- ID и тег ---
-    draw.text(
-        (160, 90),
-        f"{member.name}#{member.discriminator}" if member.discriminator != "0" else member.name,
-        font=font_small,
-        fill=SECONDARY_COLOR
-    )
-
-    # --- Уровень и опыт ---
-    draw.text(
-        (40, 160),
-        f"УРОВЕНЬ {level_info['level']}",
-        font=font_medium,
-        fill=TEXT_COLOR
-    )
-
-    # Прогресс-бар
-    bar_x, bar_y, bar_w, bar_h = 40, 200, 400, 20
-    draw.rectangle(
+    # ========== ПРОГРЕСС-БАР XP ==========
+    bar_x, bar_y, bar_w, bar_h = name_x, 120, 400, 24
+    draw.rounded_rectangle(
         [bar_x, bar_y, bar_x+bar_w, bar_y+bar_h],
-        fill=(60, 60, 80)
+        radius=12,
+        fill=PROGRESS_BG,
+        outline=None
     )
     progress_w = int(bar_w * level_info['progress'])
-    draw.rectangle(
-        [bar_x, bar_y, bar_x+progress_w, bar_y+bar_h],
-        fill=ACCENT_COLOR
-    )
-    draw.text(
-        (bar_x + bar_w + 20, bar_y),
-        f"{level_info['xp']}/{level_info['next_xp']} XP",
-        font=font_tiny,
-        fill=TEXT_COLOR
-    )
+    if progress_w > 0:
+        draw.rounded_rectangle(
+            [bar_x, bar_y, bar_x+progress_w, bar_y+bar_h],
+            radius=12,
+            fill=PROGRESS_FILL,
+            outline=None
+        )
+    # Текст XP
+    xp_text = f"{level_info['xp']} / {level_info['next_xp']} XP"
+    draw.text((bar_x + bar_w + 15, bar_y - 2), xp_text, font=font_tiny, fill=SECONDARY_COLOR)
 
-    # --- Статистика (монеты, сообщения, голос) ---
-    draw.text(
-        (40, 240),
-        f"💰 {balance} 🪙",
-        font=font_medium,
-        fill=TEXT_COLOR
-    )
-    draw.text(
-        (40, 280),
-        f"💬 {stats['messages']}",
-        font=font_medium,
-        fill=TEXT_COLOR
-    )
-    draw.text(
-        (40, 320),
-        f"🎤 {stats['voice_hours']}ч {stats['voice_remaining_minutes']}м",
-        font=font_medium,
-        fill=TEXT_COLOR
-    )
+    # ========== СТАТИСТИКА (ИКОНКИ + ЦИФРЫ) ==========
+    stats_y = 180
+    # Монеты
+    draw.text((name_x, stats_y), f"💰 {balance:,}", font=font_medium, fill=TEXT_COLOR)
+    # Сообщения
+    draw.text((name_x + 200, stats_y), f"💬 {stats['messages']:,}", font=font_medium, fill=TEXT_COLOR)
+    # Голос
+    voice_str = f"🎤 {stats['voice_hours']}ч {stats['voice_remaining_minutes']}м"
+    draw.text((name_x + 400, stats_y), voice_str, font=font_medium, fill=TEXT_COLOR)
 
-    # --- Текущая роль ---
-    draw.text(
-        (300, 240),
-        f"Роль: {current_role}",
-        font=font_medium,
-        fill=ACCENT_COLOR
-    )
+    # ========== ТЕКУЩАЯ РОЛЬ ==========
+    role_text = f"👑 {current_role}"
+    draw.text((name_x, stats_y + 45), role_text, font=font_small, fill=ACCENT_COLOR)
 
-    # --- Достижения (последние 3) ---
-    y_offset = 280
-    draw.text(
-        (300, y_offset),
-        "🏆 Последние достижения:",
-        font=font_small,
-        fill=TEXT_COLOR
-    )
-    y_offset += 30
+    # ========== ДОСТИЖЕНИЯ (МАКСИМУМ 3) ==========
+    achiv_y = 180
+    achiv_x = W - 300
+    draw.text((achiv_x, achiv_y), "🏆 ДОСТИЖЕНИЯ", font=font_small, fill=TEXT_COLOR)
+    achiv_y += 35
     if achievements:
         for ach in achievements[:3]:
-            ach_text = f"{ach['icon']} {ach['description']}"
-            # Обрезаем, если слишком длинное
-            if len(ach_text) > 40:
-                ach_text = ach_text[:37] + "..."
-            draw.text(
-                (320, y_offset),
-                ach_text,
-                font=font_tiny,
-                fill=SECONDARY_COLOR
-            )
-            y_offset += 25
+            ach_text = f"{ach['icon']} {ach['description'][:25]}…" if len(ach['description']) > 25 else f"{ach['icon']} {ach['description']}"
+            draw.text((achiv_x + 10, achiv_y), ach_text, font=font_tiny, fill=SECONDARY_COLOR)
+            achiv_y += 25
     else:
-        draw.text(
-            (320, y_offset),
-            "Пока нет достижений",
-            font=font_tiny,
-            fill=SECONDARY_COLOR
-        )
+        draw.text((achiv_x + 10, achiv_y), "— Нет достижений —", font=font_tiny, fill=SECONDARY_COLOR)
+
+    # ========== НИЖНИЙ КОЛОНТИТУЛ ==========
+    footer_text = f"🆔 {member.id}  •  {theme['name']}"
+    draw.text((30, H-40), footer_text, font=font_tiny, fill=SECONDARY_COLOR)
 
     return img
-
 # ==================== FLASK ДЛЯ UPTIMEROBOT ====================
 app = Flask(__name__)
 
