@@ -34,10 +34,10 @@ class Database:
         if self.pool is None:
             db_url = os.environ.get("DATABASE_URL")
             if not db_url:
-                print("❌ ОШИБКА: DATABASE_URL не задан!")
+                print("❌ ОШИБКА: DATABASE_URL не задан в переменных окружения!")
                 return None
-    
-            for attempt in range(5):  # 5 попыток
+
+            for attempt in range(5):
                 try:
                     self.pool = await asyncpg.create_pool(
                         db_url,
@@ -45,18 +45,23 @@ class Database:
                         max_size=10,
                         command_timeout=60
                     )
-                    print("✅ Подключение к БД установлено")
+                    print(f"✅ Подключение к БД установлено (попытка {attempt+1})")
                     break
                 except Exception as e:
                     print(f"⚠️ Попытка {attempt+1}/5 подключения к БД не удалась: {e}")
                     if attempt == 4:
                         print("❌ Не удалось подключиться к БД после 5 попыток")
                         return None
-                    await asyncio.sleep(2 ** attempt)  # экспоненциальная задержка
+                    await asyncio.sleep(2 ** attempt)
         return self.pool
 
     async def init_db(self):
+        """Инициализация таблиц и добавление недостающих колонок"""
         pool = await self.connect()
+        if pool is None:
+            print("❌ Инициализация БД невозможна — нет соединения")
+            return
+
         async with pool.acquire() as conn:
             # Таблица пользователей
             await conn.execute("""
@@ -81,13 +86,29 @@ class Database:
                     message_events BOOLEAN DEFAULT FALSE,
                     command_events BOOLEAN DEFAULT TRUE,
                     telegram_notify_role BOOLEAN DEFAULT FALSE,
-                    telegram_daily_report BOOLEAN DEFAULT TRUE,
-                    backup_channel BIGINT,
-                    economy_enabled BOOLEAN DEFAULT TRUE,
-                    achievements_enabled BOOLEAN DEFAULT TRUE
+                    telegram_daily_report BOOLEAN DEFAULT TRUE
                 )
             """)
-            print("✅ Таблица guild_config готова")
+            print("✅ Таблица guild_config создана/проверена")
+
+            # ----- ДОБАВЛЯЕМ НЕДОСТАЮЩИЕ КОЛОНКИ (если их нет) -----
+            try:
+                await conn.execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS backup_channel BIGINT")
+                print("✅ Колонка backup_channel добавлена/проверена")
+            except Exception as e:
+                print(f"⚠️ Не удалось добавить backup_channel: {e}")
+
+            try:
+                await conn.execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS economy_enabled BOOLEAN DEFAULT TRUE")
+                print("✅ Колонка economy_enabled добавлена/проверена")
+            except Exception as e:
+                print(f"⚠️ Не удалось добавить economy_enabled: {e}")
+
+            try:
+                await conn.execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS achievements_enabled BOOLEAN DEFAULT TRUE")
+                print("✅ Колонка achievements_enabled добавлена/проверена")
+            except Exception as e:
+                print(f"⚠️ Не удалось добавить achievements_enabled: {e}")
 
             # Таблица предупреждений
             await conn.execute("""
@@ -234,6 +255,7 @@ class Database:
     # ----- МЕТОДЫ ДЛЯ ПОЛЬЗОВАТЕЛЕЙ -----
     async def add_message(self, user_id: int):
         pool = await self.connect()
+        if not pool: return
         async with pool.acquire() as conn:
             await conn.execute("""
                 INSERT INTO users (user_id, messages) VALUES ($1, 1)
@@ -244,6 +266,7 @@ class Database:
     async def add_voice_time(self, user_id: int, minutes: int):
         print(f"[VOICE] add_voice_time: user={user_id}, minutes={minutes}")
         pool = await self.connect()
+        if not pool: return
         async with pool.acquire() as conn:
             await conn.execute("""
                 INSERT INTO users (user_id, voice_minutes) VALUES ($1, $2)
@@ -254,6 +277,7 @@ class Database:
     async def get_user_stats(self, user_id: int):
         print(f"[STATS] get_user_stats: user={user_id}")
         pool = await self.connect()
+        if not pool: return {'messages': 0, 'voice_minutes': 0, 'voice_hours': 0, 'voice_remaining_minutes': 0}
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT messages, voice_minutes FROM users WHERE user_id = $1",
@@ -277,6 +301,7 @@ class Database:
     async def get_top_users(self, limit: int = 10):
         print(f"[TOP] get_top_users called")
         pool = await self.connect()
+        if not pool: return [], []
         async with pool.acquire() as conn:
             voice_rows = await conn.fetch("""
                 SELECT user_id, voice_minutes FROM users
@@ -293,12 +318,13 @@ class Database:
 
     async def get_total_users(self):
         pool = await self.connect()
+        if not pool: return 0
         async with pool.acquire() as conn:
-            row = await conn.fetchval("SELECT COUNT(*) FROM users")
-            return row
+            return await conn.fetchval("SELECT COUNT(*) FROM users") or 0
 
     async def get_total_stats(self):
         pool = await self.connect()
+        if not pool: return {'total_messages': 0, 'total_voice': 0}
         async with pool.acquire() as conn:
             row = await conn.fetchrow("""
                 SELECT 
@@ -314,6 +340,7 @@ class Database:
     # ----- МЕТОДЫ ДЛЯ РАБОТЫ С УРОВНЯМИ -----
     async def add_xp(self, user_id: int, xp: int):
         pool = await self.connect()
+        if not pool: return False, 0
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT xp, level FROM levels WHERE user_id = $1",
@@ -342,6 +369,7 @@ class Database:
 
     async def get_level_info(self, user_id: int):
         pool = await self.connect()
+        if not pool: return {'xp': 0, 'level': 0, 'next_xp': 25, 'progress': 0, 'remaining': 25}
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT xp, level FROM levels WHERE user_id = $1",
@@ -371,6 +399,7 @@ class Database:
     # ----- ИСТОРИЯ АКТИВНОСТИ -----
     async def save_daily_stats(self, user_id: int, guild_id: int, voice_minutes: int, messages: int):
         pool = await self.connect()
+        if not pool: return
         async with pool.acquire() as conn:
             await conn.execute("""
                 INSERT INTO user_history (user_id, guild_id, date, voice_minutes, messages)
@@ -382,6 +411,7 @@ class Database:
 
     async def get_user_history(self, user_id: int, guild_id: int, days: int = 30):
         pool = await self.connect()
+        if not pool: return []
         async with pool.acquire() as conn:
             rows = await conn.fetch("""
                 SELECT date, voice_minutes, messages
@@ -395,6 +425,7 @@ class Database:
     # ----- НАСТРОЙКИ СЕРВЕРОВ -----
     async def get_guild_config(self, guild_id: int):
         pool = await self.connect()
+        if not pool: return {}
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT * FROM guild_config WHERE guild_id = $1",
@@ -422,6 +453,7 @@ class Database:
 
     async def set_log_channel(self, guild_id: int, channel_id: int):
         pool = await self.connect()
+        if not pool: return
         async with pool.acquire() as conn:
             await conn.execute("""
                 INSERT INTO guild_config (guild_id, log_channel)
@@ -431,6 +463,7 @@ class Database:
 
     async def set_backup_channel(self, guild_id: int, channel_id: int):
         pool = await self.connect()
+        if not pool: return
         async with pool.acquire() as conn:
             await conn.execute("""
                 INSERT INTO guild_config (guild_id, backup_channel)
@@ -440,6 +473,7 @@ class Database:
 
     async def update_guild_config(self, guild_id: int, key: str, value):
         pool = await self.connect()
+        if not pool: return
         async with pool.acquire() as conn:
             await conn.execute(f"""
                 INSERT INTO guild_config (guild_id, {key})
@@ -450,6 +484,7 @@ class Database:
     # ----- ПРЕДУПРЕЖДЕНИЯ -----
     async def add_warn(self, guild_id: int, user_id: int, moderator_id: int, reason: str):
         pool = await self.connect()
+        if not pool: return
         async with pool.acquire() as conn:
             await conn.execute("""
                 INSERT INTO warns (guild_id, user_id, moderator_id, reason)
@@ -458,6 +493,7 @@ class Database:
 
     async def get_warns(self, guild_id: int, user_id: int):
         pool = await self.connect()
+        if not pool: return []
         async with pool.acquire() as conn:
             rows = await conn.fetch("""
                 SELECT * FROM warns 
@@ -468,6 +504,7 @@ class Database:
 
     async def clear_warns(self, guild_id: int, user_id: int):
         pool = await self.connect()
+        if not pool: return
         async with pool.acquire() as conn:
             await conn.execute("""
                 DELETE FROM warns WHERE guild_id = $1 AND user_id = $2
@@ -475,12 +512,14 @@ class Database:
 
     async def remove_warn(self, warn_id: int):
         pool = await self.connect()
+        if not pool: return
         async with pool.acquire() as conn:
             await conn.execute("DELETE FROM warns WHERE id = $1", warn_id)
 
     # ----- МЕТОДЫ ДЛЯ ЭКОНОМИКИ -----
     async def get_balance(self, user_id: int):
         pool = await self.connect()
+        if not pool: return 0
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT balance FROM economy WHERE user_id = $1",
@@ -490,6 +529,7 @@ class Database:
 
     async def add_coins(self, user_id: int, amount: int):
         pool = await self.connect()
+        if not pool: return
         async with pool.acquire() as conn:
             await conn.execute("""
                 INSERT INTO economy (user_id, balance, total_earned)
@@ -501,6 +541,7 @@ class Database:
 
     async def remove_coins(self, user_id: int, amount: int):
         pool = await self.connect()
+        if not pool: return
         async with pool.acquire() as conn:
             await conn.execute("""
                 UPDATE economy SET balance = balance - $1
@@ -509,6 +550,7 @@ class Database:
 
     async def get_eco_top(self, limit: int = 10):
         pool = await self.connect()
+        if not pool: return []
         async with pool.acquire() as conn:
             rows = await conn.fetch("""
                 SELECT user_id, balance FROM economy
@@ -519,6 +561,7 @@ class Database:
     # ----- МАГАЗИН РОЛЕЙ -----
     async def add_shop_role(self, guild_id: int, role_id: int, price: int, description: str = None):
         pool = await self.connect()
+        if not pool: return
         async with pool.acquire() as conn:
             await conn.execute("""
                 INSERT INTO shop_roles (guild_id, role_id, price, description)
@@ -527,11 +570,13 @@ class Database:
 
     async def remove_shop_role(self, role_id: int):
         pool = await self.connect()
+        if not pool: return
         async with pool.acquire() as conn:
             await conn.execute("DELETE FROM shop_roles WHERE role_id = $1", role_id)
 
     async def get_shop_roles(self, guild_id: int):
         pool = await self.connect()
+        if not pool: return []
         async with pool.acquire() as conn:
             rows = await conn.fetch("""
                 SELECT * FROM shop_roles WHERE guild_id = $1 ORDER BY price
@@ -540,6 +585,7 @@ class Database:
 
     async def purchase_role(self, guild_id: int, user_id: int, role_id: int):
         pool = await self.connect()
+        if not pool: return
         async with pool.acquire() as conn:
             await conn.execute("""
                 INSERT INTO purchased_roles (guild_id, user_id, role_id)
@@ -549,6 +595,7 @@ class Database:
 
     async def has_role_purchased(self, guild_id: int, user_id: int, role_id: int):
         pool = await self.connect()
+        if not pool: return False
         async with pool.acquire() as conn:
             row = await conn.fetchrow("""
                 SELECT 1 FROM purchased_roles
@@ -572,6 +619,7 @@ class Database:
             ("first_purchase", "Шопинг для гeeв", "Купить первую роль в магазине", 20, 0, "🛒"),
         ]
         pool = await self.connect()
+        if not pool: return
         async with pool.acquire() as conn:
             for name, title, desc, xp, coins, icon in achievements:
                 await conn.execute("""
@@ -587,6 +635,7 @@ class Database:
 
     async def check_achievement(self, user_id: int, achievement_name: str, guild: discord.Guild = None):
         pool = await self.connect()
+        if not pool: return False
         async with pool.acquire() as conn:
             ach = await conn.fetchrow(
                 "SELECT id, xp_reward, coin_reward, icon, description FROM achievements WHERE name = $1",
@@ -629,6 +678,7 @@ class Database:
 
     async def get_user_achievements(self, user_id: int):
         pool = await self.connect()
+        if not pool: return []
         async with pool.acquire() as conn:
             rows = await conn.fetch("""
                 SELECT a.id, a.name, a.description, a.icon, ua.earned_at
@@ -641,6 +691,7 @@ class Database:
 
     async def get_all_achievements(self):
         pool = await self.connect()
+        if not pool: return []
         async with pool.acquire() as conn:
             rows = await conn.fetch("""
                 SELECT * FROM achievements ORDER BY id
@@ -652,6 +703,7 @@ class Database:
         if date is None:
             date = datetime.date.today()
         pool = await self.connect()
+        if not pool: return
         async with pool.acquire() as conn:
             guild = bot.get_guild(guild_id)
             if not guild:
@@ -683,6 +735,7 @@ class Database:
 
     async def get_server_stats(self, guild_id: int, days: int = 7):
         pool = await self.connect()
+        if not pool: return []
         async with pool.acquire() as conn:
             rows = await conn.fetch("""
                 SELECT * FROM server_history
@@ -704,6 +757,7 @@ class Database:
             ("Киберпанк", 0xFF00FF, 0x000000, 0x0F0F0F, None, "cyber", 12000, None, True),
         ]
         pool = await self.connect()
+        if not pool: return
         async with pool.acquire() as conn:
             for name, accent, bg, card, overlay, style, price, preview, purchasable in themes:
                 await conn.execute("""
@@ -717,6 +771,7 @@ class Database:
     async def get_user_profile(self, user_id: int):
         """Возвращает настройки профиля пользователя"""
         pool = await self.connect()
+        if not pool: return {'user_id': user_id, 'theme_id': 1, 'custom_accent_color': None, 'custom_bg_color': None}
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT * FROM user_profile WHERE user_id = $1",
@@ -733,6 +788,7 @@ class Database:
     async def set_user_theme(self, user_id: int, theme_id: int):
         """Устанавливает тему профиля"""
         pool = await self.connect()
+        if not pool: return
         async with pool.acquire() as conn:
             await conn.execute("""
                 INSERT INTO user_profile (user_id, theme_id)
@@ -743,6 +799,7 @@ class Database:
     async def set_custom_colors(self, user_id: int, accent_color: int = None, bg_color: int = None):
         """Устанавливает пользовательские цвета"""
         pool = await self.connect()
+        if not pool: return
         async with pool.acquire() as conn:
             await conn.execute("""
                 INSERT INTO user_profile (user_id, custom_accent_color, custom_bg_color)
@@ -754,6 +811,7 @@ class Database:
     async def get_theme_by_id(self, theme_id: int):
         """Получает данные темы по ID"""
         pool = await self.connect()
+        if not pool: return None
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT * FROM profile_themes WHERE id = $1",
@@ -764,6 +822,7 @@ class Database:
     async def get_all_themes(self):
         """Возвращает все доступные темы"""
         pool = await self.connect()
+        if not pool: return []
         async with pool.acquire() as conn:
             rows = await conn.fetch("SELECT * FROM profile_themes ORDER BY price")
             return [dict(row) for row in rows]
@@ -783,6 +842,7 @@ class Database:
     async def get_level_top(self, limit: int = 10):
         """Возвращает топ пользователей по уровню и опыту"""
         pool = await self.connect()
+        if not pool: return []
         async with pool.acquire() as conn:
             rows = await conn.fetch("""
                 SELECT user_id, level, xp FROM levels
@@ -1341,13 +1401,14 @@ async def collect_stats():
 
 @tasks.loop(time=datetime_time(hour=3, minute=0))
 async def backup_db():
+    """Ежедневный бэкап базы данных в Telegram (если доступен pg_dump)"""
     if not telegram.enabled:
         return
+    # Проверяем наличие pg_dump — тихо пропускаем, если нет
+    pg_dump_path = subprocess.run(["which", "pg_dump"], capture_output=True, text=True).stdout.strip()
+    if not pg_dump_path:
+        return  # просто тихо выходим
     try:
-        pg_dump_path = subprocess.run(["which", "pg_dump"], capture_output=True, text=True).stdout.strip()
-        if not pg_dump_path:
-            print("⚠️ pg_dump не найден, пропускаем бэкап")
-            return
         db_url = os.environ.get("DATABASE_URL")
         if not db_url:
             return
@@ -1389,7 +1450,7 @@ async def on_ready():
     print(f"📊 Серверов: {len(bot.guilds)}")
     await db.init_db()
     await db.init_achievements()
-    await db.init_profile_themes()  # <-- ДОБАВЛЕНО
+    await db.init_profile_themes()
     print("✅ База данных подключена")
     print(f"🐍 Python: {sys.version}")
     print(f"📱 Telegram: {'✅' if telegram.enabled else '❌'}")
@@ -2147,7 +2208,7 @@ async def server_stats(ctx, period: str = "week"):
     embed.set_footer(text=f"ID: {ctx.guild.id} • Время МСК")
     await ctx.send(embed=embed)
 
-# ---- КОМАНДЫ ДЛЯ ТЕМ ПРОФИЛЯ (ДОБАВЛЕНО) ----
+# ---- КОМАНДЫ ДЛЯ ТЕМ ПРОФИЛЯ ----
 @bot.command(name="магазин_тем", aliases=["themeshop"])
 async def theme_shop(ctx):
     """Показать доступные темы оформления профиля"""
@@ -2199,7 +2260,7 @@ async def buy_theme(ctx, theme_id: int):
     success, message = await db.purchase_theme(ctx.author.id, theme_id)
     await ctx.send(message)
 
-# ---- ТОП ПО УРОВНЯМ (ДОБАВЛЕНО) ----
+# ---- ТОП ПО УРОВНЯМ ----
 @bot.command(name="топ_уровней", aliases=["leveltop", "lvltop"])
 async def level_top(ctx):
     """Топ пользователей по уровню"""
@@ -2673,7 +2734,7 @@ async def generate_profile_card(member, level_info, balance, stats, achievements
     import textwrap
 
     # ========== РАЗМЕРЫ ==========
-    W, H = 1000, 380  # шире и чуть выше, чтобы всё поместилось
+    W, H = 1000, 380
     AVATAR_SIZE = 120
     AVATAR_X, AVATAR_Y = 30, 30
 
@@ -2804,7 +2865,6 @@ async def generate_profile_card(member, level_info, balance, stats, achievements
     achiv_y += 40
     if achievements:
         for ach in achievements[:3]:
-            # Форматируем: иконка + короткое описание (макс. 30 символов)
             short_desc = ach['description']
             if len(short_desc) > 30:
                 short_desc = short_desc[:28] + "…"
@@ -2845,7 +2905,7 @@ def run_flask():
 if __name__ == "__main__":
     print("=" * 60)
     print("🤖 Discord Voice Activity Bot")
-    print("📱 Версия: 13.0 (Ultimate Edition + Profile Customization + Level Top)")
+    print("📱 Версия: 1.1")
     print("⏰ Часовой пояс: Московское время (GMT+3)")
     print("📈 Система уровней и ролей за уровень")
     print("📊 Графики активности")
