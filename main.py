@@ -8,6 +8,7 @@ import sys
 import aiohttp
 from collections import defaultdict
 import pytz
+import math  # <-- НОВОЕ: для расчёта уровня
 from typing import Dict, List, Optional, Tuple, Any
 import threading
 from flask import Flask, jsonify
@@ -20,7 +21,6 @@ class Database:
         self.pool = None
 
     async def connect(self):
-        """Создаёт пул соединений с PostgreSQL"""
         if self.pool is None:
             self.pool = await asyncpg.create_pool(
                 os.environ.get("DATABASE_URL"),
@@ -30,7 +30,6 @@ class Database:
         return self.pool
 
     async def init_db(self):
-        """Создаёт таблицы, если их нет"""
         pool = await self.connect()
         async with pool.acquire() as conn:
             # Таблица пользователей
@@ -74,9 +73,19 @@ class Database:
             """)
             print("✅ Таблица warns готова")
 
-    # ----- МЕТОДЫ ДЛЯ РАБОТЫ С ПОЛЬЗОВАТЕЛЯМИ -----
+            # ----- НОВОЕ: ТАБЛИЦА УРОВНЕЙ -----
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS levels (
+                    user_id BIGINT PRIMARY KEY,
+                    xp INT DEFAULT 0,
+                    level INT DEFAULT 0,
+                    last_xp_time TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            print("✅ Таблица levels готова")
+
+    # ----- МЕТОДЫ ДЛЯ ПОЛЬЗОВАТЕЛЕЙ (БЕЗ ИЗМЕНЕНИЙ) -----
     async def add_message(self, user_id: int):
-        """Увеличивает счётчик сообщений пользователя на 1"""
         pool = await self.connect()
         async with pool.acquire() as conn:
             await conn.execute("""
@@ -86,7 +95,6 @@ class Database:
             """, user_id)
 
     async def add_voice_time(self, user_id: int, minutes: int):
-        """Добавляет минуты голосовой активности"""
         pool = await self.connect()
         async with pool.acquire() as conn:
             await conn.execute("""
@@ -96,7 +104,6 @@ class Database:
             """, user_id, minutes)
 
     async def get_user_stats(self, user_id: int):
-        """Возвращает статистику пользователя в виде словаря"""
         pool = await self.connect()
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
@@ -119,7 +126,6 @@ class Database:
                 }
 
     async def get_top_users(self, limit: int = 10):
-        """Возвращает топ пользователей по голосу и сообщениям"""
         pool = await self.connect()
         async with pool.acquire() as conn:
             voice_rows = await conn.fetch("""
@@ -136,14 +142,12 @@ class Database:
             )
 
     async def get_total_users(self):
-        """Возвращает общее количество пользователей в базе"""
         pool = await self.connect()
         async with pool.acquire() as conn:
             row = await conn.fetchval("SELECT COUNT(*) FROM users")
             return row
 
     async def get_total_stats(self):
-        """Возвращает суммарные показатели по сообщениям и голосу"""
         pool = await self.connect()
         async with pool.acquire() as conn:
             row = await conn.fetchrow("""
@@ -157,9 +161,70 @@ class Database:
                 'total_voice': row['total_voice']
             }
 
-    # ----- НАСТРОЙКИ СЕРВЕРОВ (GUILD_CONFIG) -----
+    # ----- НОВОЕ: МЕТОДЫ ДЛЯ РАБОТЫ С УРОВНЯМИ -----
+    async def add_xp(self, user_id: int, xp: int):
+        """Добавляет опыт, обновляет уровень. Возвращает (повысился_ли_уровень, новый_уровень)"""
+        pool = await self.connect()
+        async with pool.acquire() as conn:
+            # Получаем текущие значения
+            row = await conn.fetchrow(
+                "SELECT xp, level FROM levels WHERE user_id = $1",
+                user_id
+            )
+            if row:
+                new_xp = row['xp'] + xp
+                old_level = row['level']
+            else:
+                new_xp = xp
+                old_level = 0
+                await conn.execute(
+                    "INSERT INTO levels (user_id, xp, level) VALUES ($1, 0, 0)",
+                    user_id
+                )
+
+            # Формула: уровень = (sqrt(100*(2*xp+25)) + 50) // 100
+            new_level = int((math.sqrt(100 * (2 * new_xp + 25)) + 50) // 100)
+
+            await conn.execute("""
+                UPDATE levels 
+                SET xp = $1, level = $2, last_xp_time = NOW()
+                WHERE user_id = $3
+            """, new_xp, new_level, user_id)
+
+            return new_level > old_level, new_level
+
+    async def get_level_info(self, user_id: int):
+        """Возвращает информацию об уровне: xp, level, xp_for_next, progress"""
+        pool = await self.connect()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT xp, level FROM levels WHERE user_id = $1",
+                user_id
+            )
+            if row:
+                xp = row['xp']
+                level = row['level']
+                # XP до следующего уровня: next_level_xp = ((level+1)*100 - 50)^2 / 100
+                next_level_xp = int(((level + 1) * 100 - 50) ** 2 / 100)
+                progress = xp / next_level_xp if next_level_xp > 0 else 0
+                return {
+                    'xp': xp,
+                    'level': level,
+                    'next_xp': next_level_xp,
+                    'progress': progress,
+                    'remaining': next_level_xp - xp
+                }
+            else:
+                return {
+                    'xp': 0,
+                    'level': 0,
+                    'next_xp': 25,  # для 1 уровня нужно 25 XP
+                    'progress': 0,
+                    'remaining': 25
+                }
+
+    # ----- НАСТРОЙКИ СЕРВЕРОВ (БЕЗ ИЗМЕНЕНИЙ) -----
     async def get_guild_config(self, guild_id: int):
-        """Получает конфигурацию сервера. Если нет — возвращает значения по умолчанию."""
         pool = await self.connect()
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
@@ -184,7 +249,6 @@ class Database:
                 }
 
     async def set_log_channel(self, guild_id: int, channel_id: int):
-        """Устанавливает канал для логов (или удаляет, если channel_id = None)"""
         pool = await self.connect()
         async with pool.acquire() as conn:
             await conn.execute("""
@@ -194,7 +258,6 @@ class Database:
             """, guild_id, channel_id)
 
     async def update_guild_config(self, guild_id: int, key: str, value):
-        """Обновляет конкретное поле конфигурации"""
         pool = await self.connect()
         async with pool.acquire() as conn:
             await conn.execute(f"""
@@ -203,7 +266,7 @@ class Database:
                 ON CONFLICT (guild_id) DO UPDATE SET {key} = $2
             """, guild_id, value)
 
-    # ----- ПРЕДУПРЕЖДЕНИЯ -----
+    # ----- ПРЕДУПРЕЖДЕНИЯ (БЕЗ ИЗМЕНЕНИЙ) -----
     async def add_warn(self, guild_id: int, user_id: int, moderator_id: int, reason: str):
         pool = await self.connect()
         async with pool.acquire() as conn:
@@ -298,7 +361,7 @@ bot = commands.Bot(
 voice_sessions = {}
 guild_config_cache = {}
 
-# ==================== TELEGRAM БОТ (С ПОЛЛИНГОМ) ====================
+# ==================== TELEGRAM БОТ (БЕЗ ИЗМЕНЕНИЙ) ====================
 class TelegramBot:
     def __init__(self, token: str, chat_id: str):
         self.token = token
@@ -369,7 +432,6 @@ class TelegramBot:
         message = f"{emoji} *{title}*\n\n{description}\n\n⏰ {format_moscow_time()}"
         return await self.send_message(message)
 
-    # ========== ПОЛЛИНГ КОМАНД ==========
     async def start_polling(self):
         if not self.enabled:
             return
@@ -459,14 +521,12 @@ telegram = TelegramBot(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID)
 
 # ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ РАБОТЫ С НАСТРОЙКАМИ ====================
 async def get_guild_config(guild_id: int):
-    """Получить настройки сервера (с кэшированием)"""
     if guild_id not in guild_config_cache:
         config = await db.get_guild_config(guild_id)
         guild_config_cache[guild_id] = config
     return guild_config_cache[guild_id]
 
 async def update_guild_config(guild_id: int, key: str, value):
-    """Обновить настройку и синхронизировать с БД и кэшем"""
     await db.update_guild_config(guild_id, key, value)
     if guild_id in guild_config_cache:
         guild_config_cache[guild_id][key] = value
@@ -476,7 +536,6 @@ async def update_guild_config(guild_id: int, key: str, value):
         guild_config_cache[guild_id] = config
 
 async def set_log_channel(guild_id: int, channel_id: int):
-    """Установить лог-канал"""
     await db.set_log_channel(guild_id, channel_id)
     if guild_id in guild_config_cache:
         guild_config_cache[guild_id]['log_channel'] = channel_id
@@ -485,7 +544,7 @@ async def set_log_channel(guild_id: int, channel_id: int):
         config['log_channel'] = channel_id
         guild_config_cache[guild_id] = config
 
-# ==================== ЛОГГЕР ====================
+# ==================== ЛОГГЕР (БЕЗ ИЗМЕНЕНИЙ) ====================
 class Logger:
     @staticmethod
     async def log_event(guild: discord.Guild, event_type: str, title: str, description: str,
@@ -552,7 +611,7 @@ class Logger:
         except Exception as e:
             print(f"❌ Logger error: {e}")
 
-# ==================== МЕНЕДЖЕР РОЛЕЙ ====================
+# ==================== МЕНЕДЖЕР РОЛЕЙ (БЕЗ ИЗМЕНЕНИЙ) ====================
 class RoleManager:
     @staticmethod
     async def check_hierarchy(guild: discord.Guild, role: discord.Role) -> bool:
@@ -670,7 +729,7 @@ class RoleManager:
         except Exception as e:
             print(f"❌ Ошибка обновления роли: {e}")
 
-# ==================== ЗАДАЧИ ====================
+# ==================== ЗАДАЧИ (ОБНОВЛЕНЫ ДЛЯ УРОВНЕЙ) ====================
 @tasks.loop(minutes=5)
 async def check_voice_time():
     try:
@@ -681,7 +740,16 @@ async def check_voice_time():
             for guild in bot.guilds:
                 member = guild.get_member(member_id)
                 if member and member.voice and member.voice.channel:
+                    # Добавляем голосовое время в таблицу users
                     await db.add_voice_time(member_id, 5)
+                    # ----- НОВОЕ: НАЧИСЛЯЕМ ОПЫТ ЗА ГОЛОС (2 XP в минуту = 10 XP за 5 минут) -----
+                    leveled_up, new_level = await db.add_xp(member_id, 10)
+                    if leveled_up:
+                        try:
+                            await member.send(f"🎉 Поздравляю! Вы достигли **{new_level} уровня**!")
+                        except:
+                            pass
+                    # -------------------------------------------------------------
                     voice_sessions[user_id] = now - datetime.timedelta(minutes=duration % 5)
                     await RoleManager.check_and_give_roles(member)
                     break
@@ -700,11 +768,10 @@ async def daily_report():
     except Exception as e:
         print(f"❌ Ошибка daily_report: {e}")
 
-@tasks.loop(time=datetime_time(hour=17, minute=0))  # 17:00 UTC = 20:00 MSK
+@tasks.loop(time=datetime_time(hour=17, minute=0))
 async def weekly_top():
-    """Отправляет еженедельный топ в системный канал каждого сервера"""
     now = get_moscow_time()
-    if now.weekday() != 6:  # воскресенье
+    if now.weekday() != 6:
         return
 
     for guild in bot.guilds:
@@ -746,7 +813,7 @@ async def weekly_top():
         if channel:
             await channel.send(embed=embed)
 
-# ==================== СОБЫТИЯ DISCORD ====================
+# ==================== СОБЫТИЯ DISCORD (ОБНОВЛЕНЫ ДЛЯ УРОВНЕЙ) ====================
 @bot.event
 async def on_ready():
     print(f"✅ Бот {bot.user} запущен!")
@@ -757,7 +824,6 @@ async def on_ready():
     print(f"🐍 Python: {sys.version}")
     print(f"📱 Telegram: {'✅' if telegram.enabled else '❌'}")
 
-    # Очистка старых слэш-команд
     try:
         bot.tree.clear_commands(guild=None)
         await bot.tree.sync()
@@ -768,7 +834,6 @@ async def on_ready():
     except Exception as e:
         print(f"⚠️ Ошибка очистки команд: {e}")
 
-    # Запуск задач
     if not check_voice_time.is_running():
         check_voice_time.start()
         print("⏱️ Запущена проверка голосового времени")
@@ -781,13 +846,11 @@ async def on_ready():
         weekly_top.start()
         print("📆 Запущена еженедельная отправка топов")
 
-    # Создание ролей
     for guild in bot.guilds:
         print(f"\n🔍 Сервер: {guild.name}")
         for role_name in ROLES_CONFIG.keys():
             await RoleManager.ensure_role_exists(guild, role_name)
 
-    # Выдача начальных ролей
     print("\n🎯 Выдача начальных ролей...")
     for guild in bot.guilds:
         members = [m for m in guild.members if not m.bot]
@@ -797,7 +860,6 @@ async def on_ready():
             await asyncio.sleep(0.05)
     print("✅ Начальная выдача ролей завершена!")
 
-    # Логирование запуска
     for guild in bot.guilds:
         await Logger.log_event(
             guild=guild,
@@ -883,7 +945,16 @@ async def on_message(message):
     if message.author.bot:
         return
     if not message.content.startswith('!'):
+        # Статистика сообщений
         await db.add_message(message.author.id)
+        # ----- НОВОЕ: НАЧИСЛЯЕМ ОПЫТ ЗА СООБЩЕНИЕ (5 XP) -----
+        leveled_up, new_level = await db.add_xp(message.author.id, 5)
+        if leveled_up:
+            try:
+                await message.author.send(f"🎉 Поздравляю! Вы достигли **{new_level} уровня**!")
+            except:
+                pass
+        # -------------------------------------------------------
         if isinstance(message.author, discord.Member):
             await RoleManager.check_and_give_roles(message.author)
     await bot.process_commands(message)
@@ -960,6 +1031,15 @@ async def on_voice_state_update(member, before, after):
             duration = (now - voice_sessions[user_id]).total_seconds() / 60
             if duration >= 1:
                 await db.add_voice_time(member.id, int(duration))
+                # ----- НОВОЕ: НАЧИСЛЯЕМ ОПЫТ ЗА ГОЛОС (2 XP в минуту) -----
+                xp_gain = int(duration) * 2
+                leveled_up, new_level = await db.add_xp(member.id, xp_gain)
+                if leveled_up:
+                    try:
+                        await member.send(f"🎉 Поздравляю! Вы достигли **{new_level} уровня**!")
+                    except:
+                        pass
+                # ----------------------------------------------------------
                 await RoleManager.check_and_give_roles(member)
                 config = await get_guild_config(member.guild.id)
                 if config.get("voice_events", True):
@@ -983,6 +1063,10 @@ async def on_voice_state_update(member, before, after):
             duration = (now - voice_sessions[user_id]).total_seconds() / 60
             if duration >= 1:
                 await db.add_voice_time(member.id, int(duration))
+                # ----- НОВОЕ: ОПЫТ ЗА ПРЕДЫДУЩИЙ КАНАЛ -----
+                xp_gain = int(duration) * 2
+                await db.add_xp(member.id, xp_gain)
+                # --------------------------------------------
             voice_sessions[user_id] = now
             config = await get_guild_config(member.guild.id)
             if config.get("voice_events", True):
@@ -1032,12 +1116,14 @@ async def on_guild_channel_delete(channel: discord.abc.GuildChannel):
         }
     )
 
-# ==================== КОМАНДЫ DISCORD ====================
+# ==================== КОМАНДЫ DISCORD (ОБНОВЛЕНЫ) ====================
 @bot.command(name="статистика")
 async def stats(ctx, member: discord.Member = None):
     if not member:
         member = ctx.author
     data = await db.get_user_stats(member.id)
+    # ----- НОВОЕ: ПОЛУЧАЕМ ДАННЫЕ УРОВНЯ -----
+    level_info = await db.get_level_info(member.id)
 
     embed = discord.Embed(
         title=f"📊 Статистика {member.display_name}",
@@ -1052,6 +1138,12 @@ async def stats(ctx, member: discord.Member = None):
     embed.add_field(
         name="💬 Сообщений",
         value=f"**{data['messages']}**",
+        inline=True
+    )
+    # ----- НОВОЕ: ПОЛЕ С УРОВНЕМ -----
+    embed.add_field(
+        name="📈 Уровень",
+        value=f"**{level_info['level']}** (✨ {level_info['xp']} XP)",
         inline=True
     )
 
@@ -1106,10 +1198,38 @@ async def top(ctx):
     embed.set_footer(text=f"Всего в базе: {total_users} пользователей • Время МСК")
     await ctx.send(embed=embed)
 
+# ----- НОВАЯ КОМАНДА: УРОВЕНЬ -----
+@bot.command(name="уровень", aliases=["level", "lvl"])
+async def level(ctx, member: discord.Member = None):
+    """Показывает уровень, опыт и прогресс до следующего уровня"""
+    if member is None:
+        member = ctx.author
+
+    info = await db.get_level_info(member.id)
+
+    embed = discord.Embed(
+        title=f"📈 Уровень {member.display_name}",
+        color=discord.Color.green(),
+        timestamp=get_moscow_time()
+    )
+    embed.add_field(name="🎖️ Уровень", value=f"**{info['level']}**", inline=True)
+    embed.add_field(name="✨ Опыт", value=f"{info['xp']} / {info['next_xp']}", inline=True)
+
+    # Прогресс-бар
+    bar_length = 15
+    filled = int(bar_length * info['progress'])
+    bar = '█' * filled + '░' * (bar_length - filled)
+    embed.add_field(name="Прогресс", value=f"{bar} `{info['progress']*100:.1f}%`", inline=False)
+
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.set_footer(text=f"До следующего уровня: {info['remaining']} XP • Время МСК")
+
+    await ctx.send(embed=embed)
+
+# ==================== ОСТАЛЬНЫЕ КОМАНДЫ (БЕЗ ИЗМЕНЕНИЙ) ====================
 @bot.command(name="логи")
 @commands.has_permissions(administrator=True)
 async def logs(ctx, target_channel: discord.TextChannel = None):
-    """Управление системой логирования"""
     if target_channel:
         await set_log_channel(ctx.guild.id, target_channel.id)
         embed = discord.Embed(
@@ -1159,7 +1279,6 @@ async def logs(ctx, target_channel: discord.TextChannel = None):
 @bot.command(name="тест_лога", aliases=["тест-лога"])
 @commands.has_permissions(administrator=True)
 async def test_log(ctx):
-    """Тестирование системы логирования"""
     config = await get_guild_config(ctx.guild.id)
     if not config.get('log_channel'):
         await ctx.send("❌ Лог-канал не установлен! Используйте `!логи #канал`")
@@ -1182,7 +1301,6 @@ async def test_log(ctx):
 @bot.command(name="настройки_логов")
 @commands.has_permissions(administrator=True)
 async def log_settings(ctx, event_type: str = None, status: str = None):
-    """Настройка типов событий для логирования"""
     config = await get_guild_config(ctx.guild.id)
 
     if not event_type:
@@ -1222,7 +1340,6 @@ async def log_settings(ctx, event_type: str = None, status: str = None):
 @bot.command(name="telegram")
 @commands.has_permissions(administrator=True)
 async def telegram_cmd(ctx, action: str = None):
-    """Управление Telegram уведомлениями"""
     if not telegram.enabled:
         embed = discord.Embed(
             title="❌ Telegram не настроен",
@@ -1293,44 +1410,9 @@ async def clear_commands(ctx):
     except Exception as e:
         await ctx.send(f"❌ Ошибка: {e}")
 
-@bot.command(name="помощь")
-async def help_command(ctx):
-    embed = discord.Embed(
-        title="📚 Команды бота",
-        description=f"Префикс: `{bot.command_prefix}`",
-        color=discord.Color.green(),
-        timestamp=get_moscow_time()
-    )
-    embed.add_field(
-        name="👤 **Для всех**",
-        value="`!статистика` - ваша статистика\n`!статистика @пользователь` - статистика пользователя\n`!топ` - топ пользователей\n`!помощь` - это сообщение",
-        inline=False
-    )
-    embed.add_field(
-        name="👑 **Для администраторов**",
-        value="`!логи` - статус лог-канала\n`!логи #канал` - установить канал для логов\n`!тест_лога` - тест системы логирования\n"
-              "`!настройки_логов` - показать настройки\n`!настройки_логов [тип] [on/off]` - изменить настройки\n"
-              "`!telegram` - управление Telegram уведомлениями\n"
-              "`!warn` - выдать предупреждение\n`!warns` - список предупреждений\n`!clearwarns` - снять все предупреждения\n"
-              "`!delwarn` - удалить конкретное предупреждение\n"
-              "`!очистить_команды` - удалить старые слэш-команды",
-        inline=False
-    )
-    embed.add_field(
-        name="⚙️ **Типы событий**",
-        value="`voice_events` - голосовая активность\n`role_events` - события ролей\n`member_events` - вход/выход участников\n"
-              "`channel_events` - создание/удаление каналов\n`server_events` - изменения сервера\n"
-              "`message_events` - удаление/редактирование сообщений\n`command_events` - использование команд",
-        inline=False
-    )
-    embed.set_footer(text=f"Бот: {bot.user.name} • Время МСК")
-    await ctx.send(embed=embed)
-
-# ----- КОМАНДЫ ПРЕДУПРЕЖДЕНИЙ -----
 @bot.command(name="warn", aliases=["пред"])
 @commands.has_permissions(kick_members=True)
 async def warn(ctx, member: discord.Member, *, reason="Не указана"):
-    """Выдать предупреждение пользователю"""
     if member.top_role >= ctx.author.top_role and ctx.author != ctx.guild.owner:
         await ctx.send("❌ Вы не можете предупредить этого пользователя.")
         return
@@ -1368,7 +1450,6 @@ async def warn(ctx, member: discord.Member, *, reason="Не указана"):
 @bot.command(name="warns", aliases=["преды"])
 @commands.has_permissions(kick_members=True)
 async def warns(ctx, member: discord.Member):
-    """Показать все предупреждения пользователя"""
     warns = await db.get_warns(ctx.guild.id, member.id)
 
     if not warns:
@@ -1398,16 +1479,52 @@ async def warns(ctx, member: discord.Member):
 @bot.command(name="clearwarns", aliases=["снятьпреды"])
 @commands.has_permissions(kick_members=True)
 async def clear_warns(ctx, member: discord.Member):
-    """Снять все предупреждения с пользователя"""
     await db.clear_warns(ctx.guild.id, member.id)
     await ctx.send(f"✅ Все предупреждения сняты с {member.mention}")
 
 @bot.command(name="delwarn", aliases=["удалитьпред"])
 @commands.has_permissions(kick_members=True)
 async def del_warn(ctx, warn_id: int):
-    """Удалить конкретное предупреждение по ID"""
     await db.remove_warn(warn_id)
     await ctx.send(f"✅ Предупреждение #{warn_id} удалено.")
+
+@bot.command(name="помощь")
+async def help_command(ctx):
+    embed = discord.Embed(
+        title="📚 Команды бота",
+        description=f"Префикс: `{bot.command_prefix}`",
+        color=discord.Color.green(),
+        timestamp=get_moscow_time()
+    )
+    embed.add_field(
+        name="👤 **Для всех**",
+        value="`!статистика` - ваша статистика\n`!статистика @пользователь` - статистика пользователя\n"
+              "`!топ` - топ пользователей\n`!уровень` - ваш уровень и опыт\n"
+              "`!помощь` - это сообщение",
+        inline=False
+    )
+    embed.add_field(
+        name="👑 **Для администраторов**",
+        value="`!логи` - статус лог-канала\n`!логи #канал` - установить канал для логов\n"
+              "`!тест_лога` - тест системы логирования\n"
+              "`!настройки_логов` - показать настройки\n"
+              "`!настройки_логов [тип] [on/off]` - изменить настройки\n"
+              "`!telegram` - управление Telegram уведомлениями\n"
+              "`!warn` - выдать предупреждение\n`!warns` - список предупреждений\n"
+              "`!clearwarns` - снять все предупреждения\n`!delwarn` - удалить предупреждение\n"
+              "`!очистить_команды` - удалить старые слэш-команды",
+        inline=False
+    )
+    embed.add_field(
+        name="⚙️ **Типы событий**",
+        value="`voice_events` - голосовая активность\n`role_events` - события ролей\n"
+              "`member_events` - вход/выход участников\n`channel_events` - создание/удаление каналов\n"
+              "`server_events` - изменения сервера\n`message_events` - удаление/редактирование сообщений\n"
+              "`command_events` - использование команд",
+        inline=False
+    )
+    embed.set_footer(text=f"Бот: {bot.user.name} • Время МСК")
+    await ctx.send(embed=embed)
 
 # ==================== FLASK ДЛЯ UPTIMEROBOT ====================
 app = Flask(__name__)
@@ -1418,7 +1535,7 @@ def home():
         "status": "online",
         "bot": str(bot.user) if bot.user else "starting",
         "servers": len(bot.guilds) if bot.guilds else 0,
-        "users": 0,  # TODO: получать из БД асинхронно
+        "users": 0,
         "time": format_moscow_time()
     })
 
@@ -1434,9 +1551,10 @@ def run_flask():
 if __name__ == "__main__":
     print("=" * 60)
     print("🤖 Discord Voice Activity Bot")
-    print("📱 Версия: 7.0 (PostgreSQL + Guild Config + Warns + Weekly Top)")
+    print("📱 Версия: 8.0 (PostgreSQL + Guild Config + Warns + Weekly Top + LEVELS)")
     print("⏰ Часовой пояс: Московское время (GMT+3)")
     print("📊 Система ролей: голосовая активность")
+    print("📈 Система уровней: опыт за сообщения и голос")
     print("📝 Логирование: все события (сохраняется в БД)")
     print(f"📱 Telegram: {'✅ ПОДКЛЮЧЕН (команды: /stats, /top, /roles, /help)' if telegram.enabled else '❌ НЕ НАСТРОЕН'}")
     print("=" * 60)
