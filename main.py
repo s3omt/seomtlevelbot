@@ -21,6 +21,7 @@ import asyncpg
 import os
 import subprocess
 import tempfile
+from PIL import Image, ImageDraw, ImageFont
 
 # ==================== РАБОТА С БАЗОЙ ДАННЫХ ====================
 class Database:
@@ -1823,6 +1824,54 @@ async def activity_graph(ctx, member: discord.Member = None):
 
     await ctx.send(embed=embed, file=file)
 
+@bot.command(name="профиль", aliases=["rank", "карточка", "profile"])
+async def profile(ctx, member: discord.Member = None):
+    """Показывает карточку профиля пользователя с уровнем, монетами и достижениями"""
+    if member is None:
+        member = ctx.author
+
+    async with ctx.typing():
+        # Получаем данные
+        level_info = await db.get_level_info(member.id)
+        balance = await db.get_balance(member.id)
+        stats = await db.get_user_stats(member.id)
+        achievements = await db.get_user_achievements(member.id)
+
+        # Определяем текущую роль
+        current_role = DEFAULT_ROLE_NAME
+        for threshold in sorted(LEVEL_ROLES.keys(), reverse=True):
+            if level_info['level'] >= threshold:
+                current_role = LEVEL_ROLES[threshold]
+                break
+
+        # Загружаем аватар
+        avatar_bytes = await fetch_avatar(member, 256)
+
+        # Создаём изображение
+        img = await generate_profile_card(
+            member=member,
+            level_info=level_info,
+            balance=balance,
+            stats=stats,
+            achievements=achievements[:3],  # последние 3
+            current_role=current_role,
+            avatar_bytes=avatar_bytes
+        )
+
+        # Отправляем
+        with io.BytesIO() as buf:
+            img.save(buf, format='PNG')
+            buf.seek(0)
+            file = discord.File(buf, filename='profile.png')
+            embed = discord.Embed(
+                title=f"🖼️ Профиль {member.display_name}",
+                color=discord.Color.purple(),
+                timestamp=get_moscow_time()
+            )
+            embed.set_image(url="attachment://profile.png")
+            embed.set_footer(text=f"Запросил: {ctx.author.display_name} • Время МСК")
+            await ctx.send(embed=embed, file=file)
+
 # ---- НОВОЕ: ЭКОНОМИКА И МАГАЗИН РОЛЕЙ ----
 @bot.command(name="баланс", aliases=["money", "coins"])
 async def balance(ctx, member: discord.Member = None):
@@ -2463,6 +2512,15 @@ async def clear_commands(ctx):
     except Exception as e:
         await ctx.send(f"❌ Ошибка: {e}")
 
+async def fetch_avatar(member: discord.Member, size: int = 256) -> bytes:
+    """Загружает аватар пользователя и возвращает его в виде bytes"""
+    avatar_url = member.display_avatar.url
+    async with aiohttp.ClientSession() as session:
+        async with session.get(avatar_url) as resp:
+            if resp.status == 200:
+                return await resp.read()
+    return None
+
 @bot.command(name="помощь")
 async def help_command(ctx):
     embed = discord.Embed(
@@ -2480,6 +2538,7 @@ async def help_command(ctx):
               "`!магазин` - магазин ролей\n`!купить <роль>` - купить роль\n"
               "`!достижения` - ваши достижения\n`!все_достижения` - список всех достижений\n"
               "`!помощь` - это сообщение",
+              "`!профиль` - ваша карточка профиля\n`!профиль @пользователь` - карточка пользователя",
         inline=False
     )
     embed.add_field(
@@ -2523,6 +2582,163 @@ async def on_command_error(ctx, error):
     else:
         print(f"❌ Необработанная ошибка в команде {ctx.command}: {error}")
         await ctx.send(f"❌ Произошла ошибка: {error}")
+
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
+import textwrap
+
+async def generate_profile_card(member, level_info, balance, stats, achievements, current_role, avatar_bytes):
+    """Генерирует красивую карточку профиля"""
+    # Размеры
+    W, H = 800, 400
+    BG_COLOR = (30, 30, 40, 255)  # тёмно-серый
+    CARD_COLOR = (20, 20, 30, 230)  # почти чёрный с прозрачностью
+    ACCENT_COLOR = (255, 215, 0)  # золотой
+    TEXT_COLOR = (255, 255, 255)
+    SECONDARY_COLOR = (200, 200, 200)
+
+    # Создаём базовое изображение
+    img = Image.new('RGBA', (W, H), BG_COLOR)
+    draw = ImageDraw.Draw(img)
+
+    # Пытаемся загрузить шрифты, если нет — используем дефолтный
+    try:
+        font_big = ImageFont.truetype("arial.ttf", 36)
+        font_medium = ImageFont.truetype("arial.ttf", 24)
+        font_small = ImageFont.truetype("arial.ttf", 18)
+        font_tiny = ImageFont.truetype("arial.ttf", 14)
+    except:
+        font_big = ImageFont.load_default()
+        font_medium = ImageFont.load_default()
+        font_small = ImageFont.load_default()
+        font_tiny = ImageFont.load_default()
+
+    # Рисуем карточку (прямоугольник со скруглёнными углами)
+    card_x, card_y, card_w, card_h = 20, 20, W-40, H-40
+    draw.rounded_rectangle(
+        [card_x, card_y, card_x+card_w, card_y+card_h],
+        radius=20,
+        fill=CARD_COLOR,
+        outline=ACCENT_COLOR,
+        width=2
+    )
+
+    # --- Аватар ---
+    if avatar_bytes:
+        try:
+            avatar_img = Image.open(io.BytesIO(avatar_bytes)).convert('RGBA')
+            avatar_img = avatar_img.resize((100, 100), Image.LANCZOS)
+
+            # Маска для круглого аватара
+            mask = Image.new('L', avatar_img.size, 0)
+            mask_draw = ImageDraw.Draw(mask)
+            mask_draw.ellipse((0, 0, 100, 100), fill=255)
+            avatar_img.putalpha(mask)
+
+            img.paste(avatar_img, (40, 40), avatar_img)
+        except:
+            pass
+
+    # --- Имя пользователя ---
+    draw.text(
+        (160, 45),
+        member.display_name,
+        font=font_big,
+        fill=ACCENT_COLOR
+    )
+
+    # --- ID и тег ---
+    draw.text(
+        (160, 90),
+        f"{member.name}#{member.discriminator}" if member.discriminator != "0" else member.name,
+        font=font_small,
+        fill=SECONDARY_COLOR
+    )
+
+    # --- Уровень и опыт ---
+    draw.text(
+        (40, 160),
+        f"УРОВЕНЬ {level_info['level']}",
+        font=font_medium,
+        fill=TEXT_COLOR
+    )
+
+    # Прогресс-бар
+    bar_x, bar_y, bar_w, bar_h = 40, 200, 400, 20
+    draw.rectangle(
+        [bar_x, bar_y, bar_x+bar_w, bar_y+bar_h],
+        fill=(60, 60, 80)
+    )
+    progress_w = int(bar_w * level_info['progress'])
+    draw.rectangle(
+        [bar_x, bar_y, bar_x+progress_w, bar_y+bar_h],
+        fill=ACCENT_COLOR
+    )
+    draw.text(
+        (bar_x + bar_w + 20, bar_y),
+        f"{level_info['xp']}/{level_info['next_xp']} XP",
+        font=font_tiny,
+        fill=TEXT_COLOR
+    )
+
+    # --- Статистика (монеты, сообщения, голос) ---
+    draw.text(
+        (40, 240),
+        f"💰 {balance} 🪙",
+        font=font_medium,
+        fill=TEXT_COLOR
+    )
+    draw.text(
+        (40, 280),
+        f"💬 {stats['messages']}",
+        font=font_medium,
+        fill=TEXT_COLOR
+    )
+    draw.text(
+        (40, 320),
+        f"🎤 {stats['voice_hours']}ч {stats['voice_remaining_minutes']}м",
+        font=font_medium,
+        fill=TEXT_COLOR
+    )
+
+    # --- Текущая роль ---
+    draw.text(
+        (300, 240),
+        f"Роль: {current_role}",
+        font=font_medium,
+        fill=ACCENT_COLOR
+    )
+
+    # --- Достижения (последние 3) ---
+    y_offset = 280
+    draw.text(
+        (300, y_offset),
+        "🏆 Последние достижения:",
+        font=font_small,
+        fill=TEXT_COLOR
+    )
+    y_offset += 30
+    if achievements:
+        for ach in achievements[:3]:
+            ach_text = f"{ach['icon']} {ach['description']}"
+            # Обрезаем, если слишком длинное
+            if len(ach_text) > 40:
+                ach_text = ach_text[:37] + "..."
+            draw.text(
+                (320, y_offset),
+                ach_text,
+                font=font_tiny,
+                fill=SECONDARY_COLOR
+            )
+            y_offset += 25
+    else:
+        draw.text(
+            (320, y_offset),
+            "Пока нет достижений",
+            font=font_tiny,
+            fill=SECONDARY_COLOR
+        )
+
+    return img
 
 # ==================== FLASK ДЛЯ UPTIMEROBOT ====================
 app = Flask(__name__)
