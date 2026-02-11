@@ -195,6 +195,7 @@ class Database:
             """, user_id)
 
     async def add_voice_time(self, user_id: int, minutes: int):
+        print(f"[VOICE] add_voice_time: user={user_id}, minutes={minutes}")
         pool = await self.connect()
         async with pool.acquire() as conn:
             await conn.execute("""
@@ -204,6 +205,7 @@ class Database:
             """, user_id, minutes)
 
     async def get_user_stats(self, user_id: int):
+        print(f"[STATS] get_user_stats: user={user_id}")
         pool = await self.connect()
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
@@ -226,6 +228,7 @@ class Database:
                 }
 
     async def get_top_users(self, limit: int = 10):
+        print(f"[TOP] get_top_users called")
         pool = await self.connect()
         async with pool.acquire() as conn:
             voice_rows = await conn.fetch("""
@@ -1883,32 +1886,47 @@ async def shop(ctx):
 
 @bot.command(name="добавить_роль")
 @commands.has_permissions(administrator=True)
-async def add_shop_role(ctx, role: discord.Role = None, price: int = None, *, description: str = None):
-    """Добавить роль в магазин (только админ)"""
-    # Проверка наличия обязательных аргументов
-    if role is None:
-        await ctx.send("❌ Укажите роль. Пример: `!добавить_роль @Роль 1000`")
-        return
-    if price is None:
-        await ctx.send("❌ Укажите цену. Пример: `!добавить_роль @Роль 1000`")
-        return
+async def add_shop_role(ctx, role_name: str, price: int, *, description: str = None):
+    """Добавить роль в магазин. Если роль не существует, она будет создана."""
     if price <= 0:
         await ctx.send("❌ Цена должна быть положительным числом.")
         return
+
+    # Поиск существующей роли
+    role = discord.utils.get(ctx.guild.roles, name=role_name)
+    
+    # Создание роли, если не найдена
+    if not role:
+        try:
+            role = await ctx.guild.create_role(
+                name=role_name,
+                color=discord.Color.blurple(),
+                hoist=False,
+                mentionable=False,
+                reason="Создана для магазина ролей"
+            )
+            await ctx.send(f"🆕 Роль **{role_name}** не существовала и была создана автоматически.")
+        except discord.Forbidden:
+            await ctx.send("❌ У меня нет прав для создания ролей.")
+            return
+        except Exception as e:
+            await ctx.send(f"❌ Не удалось создать роль: {e}")
+            return
 
     # Проверка иерархии
     if not await RoleManager.check_hierarchy(ctx.guild, role):
         await ctx.send("❌ Я не могу выдавать эту роль (она выше моей).")
         return
 
-    # Проверяем, не добавлена ли уже
+    # Проверка на дубликат в магазине
     shop_roles = await db.get_shop_roles(ctx.guild.id)
     for item in shop_roles:
         if item['role_id'] == role.id:
             await ctx.send(f"❌ Роль **{role.name}** уже есть в магазине.")
             return
 
-    await db.add_shop_role(ctx.guild.id, role.id, price, description)
+    # Добавляем в БД
+    await db.add_shop_role(ctx.guild.id, role.id, price, description or "Нет описания")
     await ctx.send(f"✅ Роль **{role.name}** добавлена в магазин за {price} 🪙")
 
 @bot.command(name="удалить_роль")
@@ -2492,7 +2510,6 @@ async def help_command(ctx):
 
 @bot.event
 async def on_command_error(ctx, error):
-    """Глобальный обработчик ошибок команд"""
     if isinstance(error, commands.MissingRequiredArgument):
         await ctx.send(f"❌ Пропущен обязательный аргумент: `{error.param.name}`. Используйте `!помощь` для справки.")
     elif isinstance(error, commands.BadArgument):
@@ -2502,11 +2519,10 @@ async def on_command_error(ctx, error):
     elif isinstance(error, commands.BotMissingPermissions):
         await ctx.send(f"❌ У бота недостаточно прав: {', '.join(error.missing_permissions)}")
     elif isinstance(error, commands.CommandNotFound):
-        # Игнорируем, чтобы не засорять логи
         pass
     else:
-        # Необработанная ошибка — логируем, но не падаем
         print(f"❌ Необработанная ошибка в команде {ctx.command}: {error}")
+        await ctx.send(f"❌ Произошла ошибка: {error}")
 
 # ==================== FLASK ДЛЯ UPTIMEROBOT ====================
 app = Flask(__name__)
