@@ -1883,11 +1883,30 @@ async def shop(ctx):
 
 @bot.command(name="добавить_роль")
 @commands.has_permissions(administrator=True)
-async def add_shop_role(ctx, role: discord.Role, price: int, *, description: str = None):
+async def add_shop_role(ctx, role: discord.Role = None, price: int = None, *, description: str = None):
     """Добавить роль в магазин (только админ)"""
+    # Проверка наличия обязательных аргументов
+    if role is None:
+        await ctx.send("❌ Укажите роль. Пример: `!добавить_роль @Роль 1000`")
+        return
+    if price is None:
+        await ctx.send("❌ Укажите цену. Пример: `!добавить_роль @Роль 1000`")
+        return
+    if price <= 0:
+        await ctx.send("❌ Цена должна быть положительным числом.")
+        return
+
+    # Проверка иерархии
     if not await RoleManager.check_hierarchy(ctx.guild, role):
         await ctx.send("❌ Я не могу выдавать эту роль (она выше моей).")
         return
+
+    # Проверяем, не добавлена ли уже
+    shop_roles = await db.get_shop_roles(ctx.guild.id)
+    for item in shop_roles:
+        if item['role_id'] == role.id:
+            await ctx.send(f"❌ Роль **{role.name}** уже есть в магазине.")
+            return
 
     await db.add_shop_role(ctx.guild.id, role.id, price, description)
     await ctx.send(f"✅ Роль **{role.name}** добавлена в магазин за {price} 🪙")
@@ -1902,9 +1921,10 @@ async def remove_shop_role(ctx, role: discord.Role):
 @bot.command(name="купить")
 async def buy_role(ctx, *, role_name: str):
     """Купить роль из магазина"""
+    # Ищем роль по имени
     role = discord.utils.get(ctx.guild.roles, name=role_name)
     if not role:
-        await ctx.send("❌ Роль не найдена.")
+        await ctx.send(f"❌ Роль **{role_name}** не найдена на сервере.")
         return
 
     # Проверяем, есть ли в магазине
@@ -1916,7 +1936,7 @@ async def buy_role(ctx, *, role_name: str):
             break
 
     if not shop_item:
-        await ctx.send("❌ Эта роль не продаётся в магазине.")
+        await ctx.send(f"❌ Роль **{role.name}** не продаётся в магазине.")
         return
 
     # Проверяем баланс
@@ -2469,6 +2489,24 @@ async def help_command(ctx):
     )
     embed.set_footer(text=f"Бот: {bot.user.name} • Время МСК")
     await ctx.send(embed=embed)
+
+@bot.event
+async def on_command_error(ctx, error):
+    """Глобальный обработчик ошибок команд"""
+    if isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send(f"❌ Пропущен обязательный аргумент: `{error.param.name}`. Используйте `!помощь` для справки.")
+    elif isinstance(error, commands.BadArgument):
+        await ctx.send(f"❌ Неверный аргумент: {error}")
+    elif isinstance(error, commands.MissingPermissions):
+        await ctx.send(f"❌ У вас нет прав для использования этой команды.")
+    elif isinstance(error, commands.BotMissingPermissions):
+        await ctx.send(f"❌ У бота недостаточно прав: {', '.join(error.missing_permissions)}")
+    elif isinstance(error, commands.CommandNotFound):
+        # Игнорируем, чтобы не засорять логи
+        pass
+    else:
+        # Необработанная ошибка — логируем, но не падаем
+        print(f"❌ Необработанная ошибка в команде {ctx.command}: {error}")
 
 # ==================== FLASK ДЛЯ UPTIMEROBOT ====================
 app = Flask(__name__)
