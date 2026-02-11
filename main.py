@@ -1900,7 +1900,7 @@ async def add_shop_role(ctx, role_name: str, price: int, *, description: str = N
         try:
             role = await ctx.guild.create_role(
                 name=role_name,
-                color=discord.Color.blurple(),
+                color=discord.Color.random(),
                 hoist=False,
                 mentionable=False,
                 reason="Создана для магазина ролей"
