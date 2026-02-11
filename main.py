@@ -132,6 +132,21 @@ class Storage:
             'voice_hours': minutes // 60,
             'voice_remaining_minutes': minutes % 60
         }
+    
+    def get_top_users(self, limit: int = 10) -> Tuple[List[Tuple[int, int]], List[Tuple[int, int]]]:
+        voice_top = sorted(
+            [(int(uid), minutes) for uid, minutes in self.voice_time.items()],
+            key=lambda x: x[1],
+            reverse=True
+        )[:limit]
+        
+        messages_top = sorted(
+            [(int(uid), count) for uid, count in self.messages.items()],
+            key=lambda x: x[1],
+            reverse=True
+        )[:limit]
+        
+        return voice_top, messages_top
 
 storage = Storage()
 
@@ -184,13 +199,61 @@ class RoleManager:
         except Exception as e:
             print(f"❌ Ошибка: {e}")
 
+    @staticmethod
+    async def check_and_give_roles(member: discord.Member):
+        try:
+            user_id = str(member.id)
+            voice_minutes = storage.voice_time.get(user_id, 0)
+
+            earned_role_name = "Залётный"
+            for role_name in reversed(ROLE_ORDER):
+                if voice_minutes >= ROLES_CONFIG[role_name]["voice_minutes"]:
+                    earned_role_name = role_name
+                    break
+
+            earned_role = discord.utils.get(member.guild.roles, name=earned_role_name)
+            if not earned_role:
+                earned_role = await RoleManager.ensure_role_exists(member.guild, earned_role_name)
+
+            if earned_role and earned_role not in member.roles:
+                roles_to_remove = []
+                for role_name in ROLES_CONFIG.keys():
+                    if role_name != earned_role_name:
+                        old_role = discord.utils.get(member.guild.roles, name=role_name)
+                        if old_role and old_role in member.roles:
+                            roles_to_remove.append(old_role)
+                
+                if roles_to_remove:
+                    await member.remove_roles(*roles_to_remove, reason="Обновление роли")
+
+                await member.add_roles(ed_role, reason=f"Голос: {voice_minutes} мин")
+                print(f"✅ Роль обновлена: {member} -> {earned_role_name}")
+
+        except Exception as e:
+            print(f"❌ Ошибка: {e}")
+
 # События
 @bot.event
 async def on_ready():
     print(f"✅ Бот {bot.user} запущен!")
     print(f"📊 Серверов: {len(bot.guilds)}")
     
-    # Запускаем задачу ТОЛЬКО здесь!
+    # ОЧИСТКА СТАРЫХ СЛЭШ-КОМАНД
+    try:
+        # Очищаем глобальные команды
+        bot.tree.clear_commands(guild=None)
+        await bot.tree.sync()
+        print("🧹 Глобальные слэш-команды очищены")
+        
+        # Очищаем команды на каждом сервере
+        for guild in bot.guilds:
+            bot.tree.clear_commands(guild=guild)
+            await bot.tree.sync(guild=guild)
+            print(f"🧹 Слэш-команды очищены на сервере: {guild.name}")
+    except Exception as e:
+        print(f"⚠️ Ошибка при очистке команд: {e}")
+    
+    # Запускаем задачу
     if not check_voice_time.is_running():
         check_voice_time.start()
         print("⏱️ Запущена проверка голосового времени")
@@ -207,11 +270,19 @@ async def on_ready():
                 await RoleManager.give_default_role(member)
 
 @bot.event
+async def on_member_join(member: discord.Member):
+    if member.bot:
+        return
+    await RoleManager.give_default_role(member)
+
+@bot.event
 async def on_message(message):
     if message.author.bot:
         return
     if not message.content.startswith('!'):
         storage.add_message(message.author.id)
+        if isinstance(message.author, discord.Member):
+            await RoleManager.check_and_give_roles(message.author)
     await bot.process_commands(message)
 
 @bot.event
@@ -229,7 +300,14 @@ async def on_voice_state_update(member, before, after):
             duration = (now - storage.voice_sessions[user_id]).total_seconds() / 60
             if duration >= 1:
                 storage.add_voice_time(member.id, int(duration))
+                await RoleManager.check_and_give_roles(member)
             del storage.voice_sessions[user_id]
+    elif before.channel is not None and after.channel is not None and before.channel != after.channel:
+        if user_id in storage.voice_sessions:
+            duration = (now - storage.voice_sessions[user_id]).total_seconds() / 60
+            if duration >= 1:
+                storage.add_voice_time(member.id, int(duration))
+            storage.voice_sessions[user_id] = now
 
 # Команды
 @bot.command(name="статистика")
@@ -245,24 +323,58 @@ async def stats(ctx, member: discord.Member = None):
     )
     embed.add_field(name="🎤 Голос", value=f"{stats['voice_hours']}ч {stats['voice_remaining_minutes']}м", inline=True)
     embed.add_field(name="💬 Сообщения", value=str(stats['messages']), inline=True)
+    
+    # Определяем роль
+    earned_role_name = "Залётный"
+    for role_name in reversed(ROLE_ORDER):
+        if stats['voice_minutes'] >= ROLES_CONFIG[role_name]["voice_minutes"]:
+            earned_role_name = role_name
+            break
+    embed.add_field(name="👑 Роль", value=f"**{earned_role_name}**", inline=False)
+    
     embed.set_thumbnail(url=member.display_avatar.url)
     embed.set_footer(text="Время МСК")
     await ctx.send(embed=embed)
 
 @bot.command(name="топ")
 async def top(ctx):
-    voice_top = sorted(storage.voice_time.items(), key=lambda x: x[1], reverse=True)[:5]
-    embed = discord.Embed(title="🏆 Топ активности", color=discord.Color.gold(), timestamp=get_moscow_time())
+    voice_top, messages_top = storage.get_top_users(10)
+    
+    embed = discord.Embed(
+        title="🏆 Топ активности",
+        color=discord.Color.gold(),
+        timestamp=get_moscow_time()
+    )
     
     voice_text = ""
-    for i, (uid, minutes) in enumerate(voice_top, 1):
-        user = ctx.guild.get_member(int(uid))
+    for i, (uid, minutes) in enumerate(voice_top[:5], 1):
+        user = ctx.guild.get_member(uid)
         name = user.display_name if user else f"ID: {uid}"
         voice_text += f"{i}. **{name}** - {minutes // 60}ч {minutes % 60}м\n"
+    embed.add_field(name="🎤 Голос (Топ 5)", value=voice_text or "Нет данных", inline=False)
     
-    embed.add_field(name="🎤 Голосовая активность", value=voice_text or "Нет данных", inline=False)
+    messages_text = ""
+    for i, (uid, count) in enumerate(messages_top[:5], 1):
+        user = ctx.guild.get_member(uid)
+        name = user.display_name if user else f"ID: {uid}"
+        messages_text += f"{i}. **{name}** - {count} сообщ.\n"
+    embed.add_field(name="💬 Сообщения (Топ 5)", value=messages_text or "Нет данных", inline=False)
+    
     embed.set_footer(text=f"Всего: {len(storage.voice_time)} пользователей")
     await ctx.send(embed=embed)
+
+@bot.command(name="очистить_команды")
+@commands.has_permissions(administrator=True)
+async def clear_commands(ctx):
+    """Очищает старые слэш-команды"""
+    try:
+        bot.tree.clear_commands(guild=None)
+        await bot.tree.sync()
+        bot.tree.clear_commands(guild=ctx.guild)
+        await bot.tree.sync(guild=ctx.guild)
+        await ctx.send("✅ Старые слэш-команды удалены! Используйте команды с префиксом `!`")
+    except Exception as e:
+        await ctx.send(f"❌ Ошибка: {e}")
 
 @bot.command(name="помощь")
 async def help_command(ctx):
@@ -272,7 +384,16 @@ async def help_command(ctx):
         color=discord.Color.green(),
         timestamp=get_moscow_time()
     )
-    embed.add_field(name="👤 Для всех", value="`!статистика` - ваша статистика\n`!топ` - топ пользователей\n`!помощь` - это сообщение", inline=False)
+    embed.add_field(
+        name="👤 Для всех",
+        value="`!статистика` - ваша статистика\n`!статистика @пользователь` - статистика пользователя\n`!топ` - топ пользователей\n`!помощь` - это сообщение",
+        inline=False
+    )
+    embed.add_field(
+        name="👑 Для администраторов",
+        value="`!очистить_команды` - удалить старые слэш-команды",
+        inline=False
+    )
     embed.set_footer(text=f"Бот: {bot.user.name}")
     await ctx.send(embed=embed)
 
@@ -299,10 +420,8 @@ if __name__ == "__main__":
     print("⏰ Часовой пояс: Московское время (GMT+3)")
     print("=" * 50)
     
-    # Запускаем Flask
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
     print("🌐 Веб-сервер запущен")
     
-    # ЗАПУСКАЕМ ТОЛЬКО БОТА!
     bot.run(TOKEN)
