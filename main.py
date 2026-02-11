@@ -360,6 +360,7 @@ class Logger:
     async def log_event(guild: discord.Guild, event_type: str, title: str, description: str,
                        color: int = None, fields: Dict = None, user: discord.Member = None,
                        channel: discord.abc.GuildChannel = None) -> None:
+        global log_channel
         try:
             if not log_channel:
                 return
@@ -793,7 +794,7 @@ async def on_voice_state_update(member, before, after):
         if user_id in voice_sessions:
             duration = (now - voice_sessions[user_id]).total_seconds() / 60
             if duration >= 1:
-                storage.add_voice_time(member.id, int(duration))
+                await db.add_voice_time(member.id, int(duration))
             voice_sessions[user_id] = now
             if log_config.get("voice_events", True):
                 await Logger.log_event(
@@ -918,17 +919,20 @@ async def top(ctx):
 
 @bot.command(name="логи")
 @commands.has_permissions(administrator=True)
-async def logs(ctx, channel: discord.TextChannel = None):
-    if channel:
-        log_channel = str(channel.id)
-        
+async def logs(ctx, target_channel: discord.TextChannel = None):
+    """Управление системой логирования"""
+    global log_channel, log_config
+
+    if target_channel:
+        log_channel = str(target_channel.id)
         embed = discord.Embed(
             title="✅ Лог-канал установлен",
-            description=f"Лог-канал: {channel.mention}",
+            description=f"Лог-канал: {target_channel.mention}",
             color=discord.Color.green(),
             timestamp=get_moscow_time()
         )
         await ctx.send(embed=embed)
+
         await Logger.log_event(
             guild=ctx.guild,
             event_type="server",
@@ -936,7 +940,7 @@ async def logs(ctx, channel: discord.TextChannel = None):
             description=f"Администратор {ctx.author.mention} установил лог-канал",
             color=0x2ecc71,
             user=ctx.author,
-            channel=channel
+            channel=target_channel
         )
     else:
         embed = discord.Embed(
@@ -961,7 +965,7 @@ async def logs(ctx, channel: discord.TextChannel = None):
         embed.set_footer(text="Используйте !настройки_логов для детальной настройки")
         await ctx.send(embed=embed)
 
-@bot.command(name="тест_лога")
+@bot.command(name="тест_лога", aliases=["тест-лога"])
 @commands.has_permissions(administrator=True)
 async def test_log(ctx):
     if not log_channel:
@@ -984,6 +988,7 @@ async def test_log(ctx):
 @bot.command(name="настройки_логов")
 @commands.has_permissions(administrator=True)
 async def log_settings(ctx, event_type: str = None, status: str = None):
+    global log_config
     if not event_type:
         embed = discord.Embed(
             title="⚙️ Настройки логирования",
@@ -1019,6 +1024,7 @@ async def log_settings(ctx, event_type: str = None, status: str = None):
 @bot.command(name="telegram")
 @commands.has_permissions(administrator=True)
 async def telegram_cmd(ctx, action: str = None):
+    global log_config
     if not telegram.enabled:
         embed = discord.Embed(
             title="❌ Telegram не настроен",
