@@ -2651,26 +2651,29 @@ async def on_command_error(ctx, error):
 
 # ==================== ГЕНЕРАЦИЯ КАРТОЧКИ ПРОФИЛЯ ====================
 async def generate_profile_card(member, level_info, balance, stats, achievements, current_role, avatar_bytes, theme):
-    """Генерирует красивую, современную карточку профиля"""
+    """Генерирует аккуратную, сбалансированную карточку профиля"""
     from PIL import Image, ImageDraw, ImageFont, ImageFilter
     import textwrap
 
-    W, H = 900, 300
+    # ========== РАЗМЕРЫ ==========
+    W, H = 1000, 380  # шире и чуть выше, чтобы всё поместилось
     AVATAR_SIZE = 120
     AVATAR_X, AVATAR_Y = 30, 30
 
+    # ========== ЦВЕТА ИЗ ТЕМЫ ==========
     def hex_to_rgb(hex_color, alpha=255):
         return ((hex_color >> 16) & 0xFF, (hex_color >> 8) & 0xFF, hex_color & 0xFF, alpha)
 
     BG_COLOR = hex_to_rgb(theme['bg_color'])
-    CARD_COLOR = hex_to_rgb(theme['card_color'], 230)
+    CARD_COLOR = hex_to_rgb(theme['card_color'], 235)
     ACCENT_COLOR = hex_to_rgb(theme['accent_color'])[:3]
     TEXT_COLOR = (255, 255, 255)
     SECONDARY_COLOR = (200, 200, 200)
     PROGRESS_BG = (60, 60, 80)
     PROGRESS_FILL = ACCENT_COLOR
 
-    def load_font(size, is_bold=False):
+    # ========== ЗАГРУЗКА ШРИФТА (с запасными вариантами) ==========
+    def load_font(size):
         font_paths = [
             "Roboto-Medium.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
@@ -2687,92 +2690,116 @@ async def generate_profile_card(member, level_info, balance, stats, achievements
                 continue
         return ImageFont.load_default()
 
-    font_large = load_font(32, True)
-    font_medium = load_font(22)
-    font_small = load_font(18)
-    font_tiny = load_font(14)
+    font_large = load_font(32)
+    font_medium = load_font(24)
+    font_small = load_font(20)
+    font_tiny = load_font(16)
+    font_micro = load_font(14)
 
+    # ========== СОЗДАНИЕ ПОЛОТНА ==========
     img = Image.new('RGBA', (W, H), BG_COLOR)
     draw = ImageDraw.Draw(img)
 
+    # ========== ЛЁГКИЙ ГРАДИЕНТ НА ФОНЕ ==========
     for i in range(H):
-        alpha = int(10 * (1 - i / H))
+        alpha = int(8 * (1 - i / H))
         draw.line([(0, i), (W, i)], fill=(*ACCENT_COLOR[:3], alpha))
 
-    card_x, card_y, card_w, card_h = 15, 15, W-30, H-30
+    # ========== ОСНОВНАЯ КАРТОЧКА ==========
+    card_pad = 15
     draw.rounded_rectangle(
-        [card_x, card_y, card_x+card_w, card_y+card_h],
+        [card_pad, card_pad, W - card_pad, H - card_pad],
         radius=20,
         fill=CARD_COLOR,
         outline=ACCENT_COLOR,
         width=3
     )
 
+    # ========== АВАТАР ==========
     if avatar_bytes:
         try:
             avatar_img = Image.open(io.BytesIO(avatar_bytes)).convert('RGBA')
             avatar_img = avatar_img.resize((AVATAR_SIZE, AVATAR_SIZE), Image.LANCZOS)
+            # Круглая маска
             mask = Image.new('L', avatar_img.size, 0)
             mask_draw = ImageDraw.Draw(mask)
             mask_draw.ellipse((0, 0, AVATAR_SIZE, AVATAR_SIZE), fill=255)
             avatar_img.putalpha(mask)
-            shadow_offset = 3
-            shadow = Image.new('RGBA', avatar_img.size, (0,0,0,100))
-            img.paste(shadow, (AVATAR_X+shadow_offset, AVATAR_Y+shadow_offset), shadow)
+            # Тень
+            shadow = Image.new('RGBA', avatar_img.size, (0, 0, 0, 80))
+            img.paste(shadow, (AVATAR_X + 3, AVATAR_Y + 3), shadow)
             img.paste(avatar_img, (AVATAR_X, AVATAR_Y), avatar_img)
         except Exception as e:
             print(f"Avatar error: {e}")
 
+    # ========== ИМЯ И ТЕГ ==========
     name_x = AVATAR_X + AVATAR_SIZE + 20
-    draw.text((name_x, 35), member.display_name, font=font_large, fill=ACCENT_COLOR)
-    draw.text((name_x, 75), f"{member.name}#{member.discriminator}" if member.discriminator != "0" else member.name,
-              font=font_small, fill=SECONDARY_COLOR)
+    draw.text((name_x, 40), member.display_name, font=font_large, fill=ACCENT_COLOR)
+    tag_text = f"{member.name}#{member.discriminator}" if member.discriminator != "0" else member.name
+    draw.text((name_x, 80), tag_text, font=font_small, fill=SECONDARY_COLOR)
 
+    # ========== УРОВЕНЬ (фиксированная позиция справа) ==========
     level_text = f"⚡ УРОВЕНЬ {level_info['level']}"
-    bbox = draw.textbbox((0,0), level_text, font=font_medium)
-    draw.text((W - bbox[2] - 30, 35), level_text, font=font_medium, fill=ACCENT_COLOR)
+    level_x = W - 250
+    level_y = 40
+    draw.text((level_x, level_y), level_text, font=font_medium, fill=ACCENT_COLOR)
 
-    bar_x, bar_y, bar_w, bar_h = name_x, 120, 400, 24
+    # ========== ПРОГРЕСС-БАР ==========
+    bar_x = name_x
+    bar_y = 130
+    bar_w = 500
+    bar_h = 26
     draw.rounded_rectangle(
-        [bar_x, bar_y, bar_x+bar_w, bar_y+bar_h],
-        radius=12,
+        [bar_x, bar_y, bar_x + bar_w, bar_y + bar_h],
+        radius=13,
         fill=PROGRESS_BG,
         outline=None
     )
     progress_w = int(bar_w * level_info['progress'])
     if progress_w > 0:
         draw.rounded_rectangle(
-            [bar_x, bar_y, bar_x+progress_w, bar_y+bar_h],
-            radius=12,
+            [bar_x, bar_y, bar_x + progress_w, bar_y + bar_h],
+            radius=13,
             fill=PROGRESS_FILL,
             outline=None
         )
     xp_text = f"{level_info['xp']} / {level_info['next_xp']} XP"
-    draw.text((bar_x + bar_w + 15, bar_y - 2), xp_text, font=font_tiny, fill=SECONDARY_COLOR)
+    draw.text((bar_x + bar_w + 20, bar_y + 2), xp_text, font=font_tiny, fill=SECONDARY_COLOR)
 
-    stats_y = 180
+    # ========== СТАТИСТИКА (три блока) ==========
+    stats_y = 190
+    # Монеты
     draw.text((name_x, stats_y), f"💰 {balance:,}", font=font_medium, fill=TEXT_COLOR)
+    # Сообщения
     draw.text((name_x + 200, stats_y), f"💬 {stats['messages']:,}", font=font_medium, fill=TEXT_COLOR)
+    # Голос
     voice_str = f"🎤 {stats['voice_hours']}ч {stats['voice_remaining_minutes']}м"
     draw.text((name_x + 400, stats_y), voice_str, font=font_medium, fill=TEXT_COLOR)
 
+    # ========== ТЕКУЩАЯ РОЛЬ ==========
     role_text = f"👑 {current_role}"
-    draw.text((name_x, stats_y + 45), role_text, font=font_small, fill=ACCENT_COLOR)
+    draw.text((name_x, stats_y + 50), role_text, font=font_small, fill=ACCENT_COLOR)
 
-    achiv_y = 180
+    # ========== ДОСТИЖЕНИЯ (ПРАВАЯ КОЛОНКА) ==========
     achiv_x = W - 300
+    achiv_y = 130
     draw.text((achiv_x, achiv_y), "🏆 ДОСТИЖЕНИЯ", font=font_small, fill=TEXT_COLOR)
-    achiv_y += 35
+    achiv_y += 40
     if achievements:
         for ach in achievements[:3]:
-            ach_text = f"{ach['icon']} {ach['description'][:25]}…" if len(ach['description']) > 25 else f"{ach['icon']} {ach['description']}"
-            draw.text((achiv_x + 10, achiv_y), ach_text, font=font_tiny, fill=SECONDARY_COLOR)
-            achiv_y += 25
+            # Форматируем: иконка + короткое описание (макс. 30 символов)
+            short_desc = ach['description']
+            if len(short_desc) > 30:
+                short_desc = short_desc[:28] + "…"
+            ach_text = f"{ach['icon']} {short_desc}"
+            draw.text((achiv_x + 10, achiv_y), ach_text, font=font_micro, fill=SECONDARY_COLOR)
+            achiv_y += 30
     else:
-        draw.text((achiv_x + 10, achiv_y), "— Нет достижений —", font=font_tiny, fill=SECONDARY_COLOR)
+        draw.text((achiv_x + 10, achiv_y), "— Нет достижений —", font=font_micro, fill=SECONDARY_COLOR)
 
+    # ========== НИЖНИЙ КОЛОНТИТУЛ ==========
     footer_text = f"🆔 {member.id}  •  {theme['name']}"
-    draw.text((30, H-40), footer_text, font=font_tiny, fill=SECONDARY_COLOR)
+    draw.text((30, H - 40), footer_text, font=font_micro, fill=SECONDARY_COLOR)
 
     return img
 
