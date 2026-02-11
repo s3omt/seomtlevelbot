@@ -3,6 +3,7 @@ from discord.ext import commands, tasks
 import json
 import asyncio
 import datetime
+from datetime import time as datetime_time
 import sys
 import aiohttp
 from collections import defaultdict
@@ -41,6 +42,37 @@ class Database:
                 )
             """)
             print("✅ Таблица users готова")
+
+            # Таблица настроек серверов
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS guild_config (
+                    guild_id BIGINT PRIMARY KEY,
+                    log_channel BIGINT,
+                    voice_events BOOLEAN DEFAULT TRUE,
+                    role_events BOOLEAN DEFAULT TRUE,
+                    member_events BOOLEAN DEFAULT TRUE,
+                    channel_events BOOLEAN DEFAULT TRUE,
+                    server_events BOOLEAN DEFAULT TRUE,
+                    message_events BOOLEAN DEFAULT FALSE,
+                    command_events BOOLEAN DEFAULT TRUE,
+                    telegram_notify_role BOOLEAN DEFAULT FALSE,
+                    telegram_daily_report BOOLEAN DEFAULT TRUE
+                )
+            """)
+            print("✅ Таблица guild_config готова")
+
+            # Таблица предупреждений
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS warns (
+                    id SERIAL PRIMARY KEY,
+                    guild_id BIGINT,
+                    user_id BIGINT,
+                    moderator_id BIGINT,
+                    reason TEXT,
+                    timestamp TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            print("✅ Таблица warns готова")
 
     # ----- МЕТОДЫ ДЛЯ РАБОТЫ С ПОЛЬЗОВАТЕЛЯМИ -----
     async def add_message(self, user_id: int):
@@ -90,12 +122,10 @@ class Database:
         """Возвращает топ пользователей по голосу и сообщениям"""
         pool = await self.connect()
         async with pool.acquire() as conn:
-            # Топ по голосу
             voice_rows = await conn.fetch("""
                 SELECT user_id, voice_minutes FROM users
                 ORDER BY voice_minutes DESC LIMIT $1
             """, limit)
-            # Топ по сообщениям
             msg_rows = await conn.fetch("""
                 SELECT user_id, messages FROM users
                 ORDER BY messages DESC LIMIT $1
@@ -126,6 +156,83 @@ class Database:
                 'total_messages': row['total_messages'],
                 'total_voice': row['total_voice']
             }
+
+    # ----- НАСТРОЙКИ СЕРВЕРОВ (GUILD_CONFIG) -----
+    async def get_guild_config(self, guild_id: int):
+        """Получает конфигурацию сервера. Если нет — возвращает значения по умолчанию."""
+        pool = await self.connect()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM guild_config WHERE guild_id = $1",
+                guild_id
+            )
+            if row:
+                return dict(row)
+            else:
+                return {
+                    'guild_id': guild_id,
+                    'log_channel': None,
+                    'voice_events': True,
+                    'role_events': True,
+                    'member_events': True,
+                    'channel_events': True,
+                    'server_events': True,
+                    'message_events': False,
+                    'command_events': True,
+                    'telegram_notify_role': False,
+                    'telegram_daily_report': True
+                }
+
+    async def set_log_channel(self, guild_id: int, channel_id: int):
+        """Устанавливает канал для логов (или удаляет, если channel_id = None)"""
+        pool = await self.connect()
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO guild_config (guild_id, log_channel)
+                VALUES ($1, $2)
+                ON CONFLICT (guild_id) DO UPDATE SET log_channel = $2
+            """, guild_id, channel_id)
+
+    async def update_guild_config(self, guild_id: int, key: str, value):
+        """Обновляет конкретное поле конфигурации"""
+        pool = await self.connect()
+        async with pool.acquire() as conn:
+            await conn.execute(f"""
+                INSERT INTO guild_config (guild_id, {key})
+                VALUES ($1, $2)
+                ON CONFLICT (guild_id) DO UPDATE SET {key} = $2
+            """, guild_id, value)
+
+    # ----- ПРЕДУПРЕЖДЕНИЯ -----
+    async def add_warn(self, guild_id: int, user_id: int, moderator_id: int, reason: str):
+        pool = await self.connect()
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO warns (guild_id, user_id, moderator_id, reason)
+                VALUES ($1, $2, $3, $4)
+            """, guild_id, user_id, moderator_id, reason)
+
+    async def get_warns(self, guild_id: int, user_id: int):
+        pool = await self.connect()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT * FROM warns 
+                WHERE guild_id = $1 AND user_id = $2 
+                ORDER BY timestamp DESC
+            """, guild_id, user_id)
+            return [dict(row) for row in rows]
+
+    async def clear_warns(self, guild_id: int, user_id: int):
+        pool = await self.connect()
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                DELETE FROM warns WHERE guild_id = $1 AND user_id = $2
+            """, guild_id, user_id)
+
+    async def remove_warn(self, warn_id: int):
+        pool = await self.connect()
+        async with pool.acquire() as conn:
+            await conn.execute("DELETE FROM warns WHERE id = $1", warn_id)
 
 # Создаём глобальный экземпляр базы данных
 db = Database()
@@ -189,18 +296,7 @@ bot = commands.Bot(
 
 # ==================== ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ====================
 voice_sessions = {}
-log_channel = None
-log_config = {
-    "voice_events": True,
-    "role_events": True,
-    "member_events": True,
-    "channel_events": True,
-    "server_events": True,
-    "message_events": False,
-    "command_events": True,
-    "telegram_notify_role": False,
-    "telegram_daily_report": True
-}
+guild_config_cache = {}
 
 # ==================== TELEGRAM БОТ (С ПОЛЛИНГОМ) ====================
 class TelegramBot:
@@ -361,39 +457,57 @@ class TelegramBot:
 
 telegram = TelegramBot(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID)
 
+# ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ РАБОТЫ С НАСТРОЙКАМИ ====================
+async def get_guild_config(guild_id: int):
+    """Получить настройки сервера (с кэшированием)"""
+    if guild_id not in guild_config_cache:
+        config = await db.get_guild_config(guild_id)
+        guild_config_cache[guild_id] = config
+    return guild_config_cache[guild_id]
+
+async def update_guild_config(guild_id: int, key: str, value):
+    """Обновить настройку и синхронизировать с БД и кэшем"""
+    await db.update_guild_config(guild_id, key, value)
+    if guild_id in guild_config_cache:
+        guild_config_cache[guild_id][key] = value
+    else:
+        config = await db.get_guild_config(guild_id)
+        config[key] = value
+        guild_config_cache[guild_id] = config
+
+async def set_log_channel(guild_id: int, channel_id: int):
+    """Установить лог-канал"""
+    await db.set_log_channel(guild_id, channel_id)
+    if guild_id in guild_config_cache:
+        guild_config_cache[guild_id]['log_channel'] = channel_id
+    else:
+        config = await db.get_guild_config(guild_id)
+        config['log_channel'] = channel_id
+        guild_config_cache[guild_id] = config
+
 # ==================== ЛОГГЕР ====================
 class Logger:
     @staticmethod
     async def log_event(guild: discord.Guild, event_type: str, title: str, description: str,
                        color: int = None, fields: Dict = None, user: discord.Member = None,
                        channel: discord.abc.GuildChannel = None) -> None:
-        global log_channel
         try:
-            if not log_channel:
-                return
-
-            # Защита: если log_channel уже объект канала или число — преобразуем
-            if isinstance(log_channel, discord.TextChannel):
-                log_channel_id = int(log_channel.id)
-            elif isinstance(log_channel, int):
-                log_channel_id = log_channel
-            elif isinstance(log_channel, str):
-                log_channel_id = int(log_channel)
-            else:
+            config = await get_guild_config(guild.id)
+            log_channel_id = config.get('log_channel')
+            if not log_channel_id:
                 return
 
             log_channel_obj = guild.get_channel(log_channel_id)
             if not log_channel_obj:
                 return
 
-            # Проверка конфигурации
             config_keys = {
                 "voice": "voice_events", "role": "role_events",
                 "member": "member_events", "channel": "channel_events",
                 "server": "server_events", "message": "message_events",
                 "command": "command_events"
             }
-            if event_type in config_keys and not log_config.get(config_keys[event_type], True):
+            if event_type in config_keys and not config.get(config_keys[event_type], True):
                 return
 
             color_map = {
@@ -542,14 +656,16 @@ class RoleManager:
                 fields={"Голосовая активность": f"{voice_minutes // 60}ч {voice_minutes % 60}м"}
             )
 
-            if telegram.enabled and log_config.get("telegram_notify_role", False):
-                await telegram.send_alert(
-                    "🎉 Новая роль",
-                    f"Пользователь **{member.display_name}** получил роль **{earned_role_name}**\n\n"
-                    f"🎤 Голос: {voice_minutes // 60}ч {voice_minutes % 60}м\n"
-                    f"💬 Сообщений: {stats['messages']}",
-                    "success"
-                )
+            if telegram.enabled:
+                config = await get_guild_config(member.guild.id)
+                if config.get("telegram_notify_role", False):
+                    await telegram.send_alert(
+                        "🎉 Новая роль",
+                        f"Пользователь **{member.display_name}** получил роль **{earned_role_name}**\n\n"
+                        f"🎤 Голос: {voice_minutes // 60}ч {voice_minutes % 60}м\n"
+                        f"💬 Сообщений: {stats['messages']}",
+                        "success"
+                    )
 
         except Exception as e:
             print(f"❌ Ошибка обновления роли: {e}")
@@ -575,11 +691,60 @@ async def check_voice_time():
 @tasks.loop(hours=24)
 async def daily_report():
     try:
-        if telegram.enabled and log_config.get("telegram_daily_report", True):
-            await telegram.send_stats()
-            print("📊 Ежедневный отчет отправлен в Telegram")
+        for guild in bot.guilds:
+            config = await get_guild_config(guild.id)
+            if telegram.enabled and config.get("telegram_daily_report", True):
+                await telegram.send_stats()
+                print(f"📊 Ежедневный отчет отправлен в Telegram для {guild.name}")
+                break
     except Exception as e:
         print(f"❌ Ошибка daily_report: {e}")
+
+@tasks.loop(time=datetime_time(hour=17, minute=0))  # 17:00 UTC = 20:00 MSK
+async def weekly_top():
+    """Отправляет еженедельный топ в системный канал каждого сервера"""
+    now = get_moscow_time()
+    if now.weekday() != 6:  # воскресенье
+        return
+
+    for guild in bot.guilds:
+        voice_top, msg_top = await db.get_top_users(10)
+
+        embed = discord.Embed(
+            title="📆 **Еженедельный топ**",
+            description="Самые активные участники за последние 7 дней",
+            color=discord.Color.gold(),
+            timestamp=get_moscow_time()
+        )
+
+        voice_text = ""
+        for i, (uid, minutes) in enumerate(voice_top[:5], 1):
+            member = guild.get_member(uid)
+            name = member.display_name if member else f"ID: {uid}"
+            voice_text += f"{i}. **{name}** — {minutes // 60}ч {minutes % 60}м\n"
+        embed.add_field(name="🎤 Голосовая активность (Топ 5)", 
+                        value=voice_text or "Нет данных", 
+                        inline=False)
+
+        msg_text = ""
+        for i, (uid, count) in enumerate(msg_top[:5], 1):
+            member = guild.get_member(uid)
+            name = member.display_name if member else f"ID: {uid}"
+            msg_text += f"{i}. **{name}** — {count} сообщ.\n"
+        embed.add_field(name="💬 Сообщения (Топ 5)", 
+                        value=msg_text or "Нет данных", 
+                        inline=False)
+
+        embed.set_footer(text="Спасибо за активность! ❤️")
+
+        channel = guild.system_channel
+        if not channel or not channel.permissions_for(guild.me).send_messages:
+            for ch in guild.text_channels:
+                if ch.permissions_for(guild.me).send_messages:
+                    channel = ch
+                    break
+        if channel:
+            await channel.send(embed=embed)
 
 # ==================== СОБЫТИЯ DISCORD ====================
 @bot.event
@@ -587,7 +752,6 @@ async def on_ready():
     print(f"✅ Бот {bot.user} запущен!")
     print(f"📊 Серверов: {len(bot.guilds)}")
 
-    # ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ
     await db.init_db()
     print("✅ База данных подключена")
     print(f"🐍 Python: {sys.version}")
@@ -613,6 +777,9 @@ async def on_ready():
         print("📊 Запущен ежедневный отчет в Telegram")
     if telegram.enabled:
         await telegram.start_polling()
+    if not weekly_top.is_running():
+        weekly_top.start()
+        print("📆 Запущена еженедельная отправка топов")
 
     # Создание ролей
     for guild in bot.guilds:
@@ -725,7 +892,8 @@ async def on_message(message):
 async def on_message_delete(message: discord.Message):
     if message.author.bot:
         return
-    if log_config.get("message_events", False):
+    config = await get_guild_config(message.guild.id)
+    if config.get("message_events", False):
         await Logger.log_event(
             guild=message.guild,
             event_type="message",
@@ -744,7 +912,8 @@ async def on_message_delete(message: discord.Message):
 async def on_message_edit(before: discord.Message, after: discord.Message):
     if before.author.bot or before.content == after.content:
         return
-    if log_config.get("message_events", False):
+    config = await get_guild_config(before.guild.id)
+    if config.get("message_events", False):
         await Logger.log_event(
             guild=before.guild,
             event_type="message",
@@ -770,7 +939,8 @@ async def on_voice_state_update(member, before, after):
     if before.channel is None and after.channel is not None:
         voice_sessions[user_id] = now
         print(f"🎤 {member} зашел в {after.channel.name}")
-        if log_config.get("voice_events", True):
+        config = await get_guild_config(member.guild.id)
+        if config.get("voice_events", True):
             await Logger.log_event(
                 guild=member.guild,
                 event_type="voice",
@@ -791,7 +961,8 @@ async def on_voice_state_update(member, before, after):
             if duration >= 1:
                 await db.add_voice_time(member.id, int(duration))
                 await RoleManager.check_and_give_roles(member)
-                if log_config.get("voice_events", True):
+                config = await get_guild_config(member.guild.id)
+                if config.get("voice_events", True):
                     await Logger.log_event(
                         guild=member.guild,
                         event_type="voice",
@@ -813,7 +984,8 @@ async def on_voice_state_update(member, before, after):
             if duration >= 1:
                 await db.add_voice_time(member.id, int(duration))
             voice_sessions[user_id] = now
-            if log_config.get("voice_events", True):
+            config = await get_guild_config(member.guild.id)
+            if config.get("voice_events", True):
                 await Logger.log_event(
                     guild=member.guild,
                     event_type="voice",
@@ -938,10 +1110,8 @@ async def top(ctx):
 @commands.has_permissions(administrator=True)
 async def logs(ctx, target_channel: discord.TextChannel = None):
     """Управление системой логирования"""
-    global log_channel, log_config
-
     if target_channel:
-        log_channel = str(target_channel.id)
+        await set_log_channel(ctx.guild.id, target_channel.id)
         embed = discord.Embed(
             title="✅ Лог-канал установлен",
             description=f"Лог-канал: {target_channel.mention}",
@@ -960,24 +1130,28 @@ async def logs(ctx, target_channel: discord.TextChannel = None):
             channel=target_channel
         )
     else:
+        config = await get_guild_config(ctx.guild.id)
+        log_channel_id = config.get('log_channel')
+
         embed = discord.Embed(
             title="📝 Управление логированием",
             color=discord.Color.purple(),
             timestamp=get_moscow_time()
         )
-        if log_channel:
-            ch = ctx.guild.get_channel(int(log_channel))
+        if log_channel_id:
+            ch = ctx.guild.get_channel(log_channel_id)
             if ch:
                 embed.add_field(name="✅ Лог-канал", value=f"{ch.mention}", inline=False)
             else:
-                embed.add_field(name="⚠️ Лог-канал не найден", value=f"ID: {log_channel}", inline=False)
+                embed.add_field(name="⚠️ Лог-канал не найден", value=f"ID: {log_channel_id}", inline=False)
         else:
             embed.add_field(name="❌ Лог-канал не установлен", value="Используйте `!логи #канал`", inline=False)
 
         config_text = ""
-        for key, value in log_config.items():
-            if not key.startswith("telegram"):
-                config_text += f"• **{key.replace('_', ' ').title()}:** {'✅' if value else '❌'}\n"
+        for key, value in config.items():
+            if key not in ['guild_id', 'log_channel'] and not key.startswith('telegram'):
+                emoji = '✅' if value else '❌'
+                config_text += f"• **{key.replace('_', ' ').title()}:** {emoji}\n"
         embed.add_field(name="⚙️ Конфигурация", value=config_text, inline=False)
         embed.set_footer(text="Используйте !настройки_логов для детальной настройки")
         await ctx.send(embed=embed)
@@ -986,9 +1160,8 @@ async def logs(ctx, target_channel: discord.TextChannel = None):
 @commands.has_permissions(administrator=True)
 async def test_log(ctx):
     """Тестирование системы логирования"""
-    global log_channel
-
-    if not log_channel:
+    config = await get_guild_config(ctx.guild.id)
+    if not config.get('log_channel'):
         await ctx.send("❌ Лог-канал не установлен! Используйте `!логи #канал`")
         return
 
@@ -1010,7 +1183,7 @@ async def test_log(ctx):
 @commands.has_permissions(administrator=True)
 async def log_settings(ctx, event_type: str = None, status: str = None):
     """Настройка типов событий для логирования"""
-    global log_config
+    config = await get_guild_config(ctx.guild.id)
 
     if not event_type:
         embed = discord.Embed(
@@ -1019,11 +1192,12 @@ async def log_settings(ctx, event_type: str = None, status: str = None):
             timestamp=get_moscow_time()
         )
         config_text = ""
-        for key, value in log_config.items():
-            if key.startswith("telegram"):
-                config_text += f"• **{key.replace('_', ' ').title()}:** {'✅' if value else '❌'}\n"
-            else:
-                config_text += f"• **{key}:** {'✅ Вкл' if value else '❌ Выкл'}\n"
+        for key, value in config.items():
+            if key in ['voice_events', 'role_events', 'member_events', 
+                      'channel_events', 'server_events', 'message_events', 
+                      'command_events', 'telegram_notify_role', 'telegram_daily_report']:
+                emoji = '✅ Вкл' if value else '❌ Выкл'
+                config_text += f"• **{key}:** {emoji}\n"
         embed.add_field(name="Текущие настройки", value=config_text, inline=False)
         embed.add_field(
             name="📝 Доступные типы",
@@ -1034,21 +1208,21 @@ async def log_settings(ctx, event_type: str = None, status: str = None):
         await ctx.send(embed=embed)
         return
 
-    if event_type not in log_config:
+    if event_type not in config:
         await ctx.send(f"❌ Неизвестный тип события: {event_type}")
         return
     if not status or status.lower() not in ['on', 'off']:
         await ctx.send(f"❌ Укажите on или off")
         return
-    log_config[event_type] = (status.lower() == 'on')
-    await ctx.send(f"✅ {event_type} теперь {'включен' if log_config[event_type] else 'выключен'}")
+
+    new_value = (status.lower() == 'on')
+    await update_guild_config(ctx.guild.id, event_type, new_value)
+    await ctx.send(f"✅ {event_type} теперь {'включен' if new_value else 'выключен'}")
 
 @bot.command(name="telegram")
 @commands.has_permissions(administrator=True)
 async def telegram_cmd(ctx, action: str = None):
     """Управление Telegram уведомлениями"""
-    global log_config
-
     if not telegram.enabled:
         embed = discord.Embed(
             title="❌ Telegram не настроен",
@@ -1057,6 +1231,8 @@ async def telegram_cmd(ctx, action: str = None):
         )
         await ctx.send(embed=embed)
         return
+
+    config = await get_guild_config(ctx.guild.id)
 
     if not action:
         embed = discord.Embed(
@@ -1071,8 +1247,8 @@ async def telegram_cmd(ctx, action: str = None):
         )
         embed.add_field(
             name="Настройки",
-            value=f"• Уведомления о ролях: {'✅' if log_config.get('telegram_notify_role', False) else '❌'}\n"
-                  f"• Ежедневный отчет: {'✅' if log_config.get('telegram_daily_report', True) else '❌'}",
+            value=f"• Уведомления о ролях: {'✅' if config.get('telegram_notify_role', False) else '❌'}\n"
+                  f"• Ежедневный отчет: {'✅' if config.get('telegram_daily_report', True) else '❌'}",
             inline=False
         )
         embed.add_field(
@@ -1085,14 +1261,14 @@ async def telegram_cmd(ctx, action: str = None):
         )
         await ctx.send(embed=embed)
     elif action == "on":
-        log_config["telegram_notify_role"] = True
+        await update_guild_config(ctx.guild.id, "telegram_notify_role", True)
         await ctx.send("✅ Уведомления о новых ролях **включены**")
     elif action == "off":
-        log_config["telegram_notify_role"] = False
+        await update_guild_config(ctx.guild.id, "telegram_notify_role", False)
         await ctx.send("❌ Уведомления о новых ролях **выключены**")
     elif action == "daily":
-        current = log_config.get("telegram_daily_report", True)
-        log_config["telegram_daily_report"] = not current
+        current = config.get("telegram_daily_report", True)
+        await update_guild_config(ctx.guild.id, "telegram_daily_report", not current)
         await ctx.send(f"✅ Ежедневный отчет {'включен' if not current else 'выключен'}")
     elif action == "test":
         success = await telegram.send_alert(
@@ -1134,7 +1310,10 @@ async def help_command(ctx):
         name="👑 **Для администраторов**",
         value="`!логи` - статус лог-канала\n`!логи #канал` - установить канал для логов\n`!тест_лога` - тест системы логирования\n"
               "`!настройки_логов` - показать настройки\n`!настройки_логов [тип] [on/off]` - изменить настройки\n"
-              "`!telegram` - управление Telegram уведомлениями\n`!очистить_команды` - удалить старые слэш-команды",
+              "`!telegram` - управление Telegram уведомлениями\n"
+              "`!warn` - выдать предупреждение\n`!warns` - список предупреждений\n`!clearwarns` - снять все предупреждения\n"
+              "`!delwarn` - удалить конкретное предупреждение\n"
+              "`!очистить_команды` - удалить старые слэш-команды",
         inline=False
     )
     embed.add_field(
@@ -1147,12 +1326,94 @@ async def help_command(ctx):
     embed.set_footer(text=f"Бот: {bot.user.name} • Время МСК")
     await ctx.send(embed=embed)
 
+# ----- КОМАНДЫ ПРЕДУПРЕЖДЕНИЙ -----
+@bot.command(name="warn", aliases=["пред"])
+@commands.has_permissions(kick_members=True)
+async def warn(ctx, member: discord.Member, *, reason="Не указана"):
+    """Выдать предупреждение пользователю"""
+    if member.top_role >= ctx.author.top_role and ctx.author != ctx.guild.owner:
+        await ctx.send("❌ Вы не можете предупредить этого пользователя.")
+        return
+
+    await db.add_warn(ctx.guild.id, member.id, ctx.author.id, reason)
+
+    warns = await db.get_warns(ctx.guild.id, member.id)
+    warn_count = len(warns)
+
+    embed = discord.Embed(
+        title="⚠️ Предупреждение",
+        color=discord.Color.orange(),
+        timestamp=get_moscow_time()
+    )
+    embed.add_field(name="Пользователь", value=member.mention, inline=True)
+    embed.add_field(name="Модератор", value=ctx.author.mention, inline=True)
+    embed.add_field(name="Причина", value=reason, inline=False)
+    embed.add_field(name="Всего предупреждений", value=warn_count, inline=True)
+    embed.set_footer(text=f"ID: {member.id}")
+
+    await ctx.send(embed=embed)
+
+    if warn_count >= 3:
+        muted_role = discord.utils.get(ctx.guild.roles, name="Muted")
+        if not muted_role:
+            muted_role = await ctx.guild.create_role(name="Muted")
+            for channel in ctx.guild.channels:
+                await channel.set_permissions(muted_role, speak=False, send_messages=False)
+        try:
+            await member.add_roles(muted_role, reason="3+ предупреждения")
+            await ctx.send(f"🔇 Пользователь {member.mention} получил мут (3+ предупреждения).")
+        except:
+            pass
+
+@bot.command(name="warns", aliases=["преды"])
+@commands.has_permissions(kick_members=True)
+async def warns(ctx, member: discord.Member):
+    """Показать все предупреждения пользователя"""
+    warns = await db.get_warns(ctx.guild.id, member.id)
+
+    if not warns:
+        await ctx.send(f"✅ У {member.mention} нет предупреждений.")
+        return
+
+    embed = discord.Embed(
+        title=f"⚠️ Предупреждения {member.display_name}",
+        color=discord.Color.orange(),
+        timestamp=get_moscow_time()
+    )
+    embed.set_thumbnail(url=member.display_avatar.url)
+
+    for i, w in enumerate(warns[:10], 1):
+        mod = ctx.guild.get_member(w['moderator_id'])
+        mod_name = mod.display_name if mod else f"ID: {w['moderator_id']}"
+        timestamp = w['timestamp'].strftime('%d.%m.%Y %H:%M')
+        embed.add_field(
+            name=f"#{i} (ID: {w['id']})",
+            value=f"**Причина:** {w['reason']}\n**Модератор:** {mod_name}\n**Дата:** {timestamp}",
+            inline=False
+        )
+
+    embed.set_footer(text=f"Всего: {len(warns)}")
+    await ctx.send(embed=embed)
+
+@bot.command(name="clearwarns", aliases=["снятьпреды"])
+@commands.has_permissions(kick_members=True)
+async def clear_warns(ctx, member: discord.Member):
+    """Снять все предупреждения с пользователя"""
+    await db.clear_warns(ctx.guild.id, member.id)
+    await ctx.send(f"✅ Все предупреждения сняты с {member.mention}")
+
+@bot.command(name="delwarn", aliases=["удалитьпред"])
+@commands.has_permissions(kick_members=True)
+async def del_warn(ctx, warn_id: int):
+    """Удалить конкретное предупреждение по ID"""
+    await db.remove_warn(warn_id)
+    await ctx.send(f"✅ Предупреждение #{warn_id} удалено.")
+
 # ==================== FLASK ДЛЯ UPTIMEROBOT ====================
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    # В синхронном окружении не можем использовать await, поэтому временно ставим 0
     return jsonify({
         "status": "online",
         "bot": str(bot.user) if bot.user else "starting",
@@ -1173,10 +1434,10 @@ def run_flask():
 if __name__ == "__main__":
     print("=" * 60)
     print("🤖 Discord Voice Activity Bot")
-    print("📱 Версия: 6.0 (PostgreSQL + Global Config)")
+    print("📱 Версия: 7.0 (PostgreSQL + Guild Config + Warns + Weekly Top)")
     print("⏰ Часовой пояс: Московское время (GMT+3)")
     print("📊 Система ролей: голосовая активность")
-    print("📝 Логирование: все события")
+    print("📝 Логирование: все события (сохраняется в БД)")
     print(f"📱 Telegram: {'✅ ПОДКЛЮЧЕН (команды: /stats, /top, /roles, /help)' if telegram.enabled else '❌ НЕ НАСТРОЕН'}")
     print("=" * 60)
 
