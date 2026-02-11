@@ -19,6 +19,8 @@ import threading
 from flask import Flask, jsonify
 import asyncpg
 import os
+import subprocess
+import tempfile
 
 # ==================== РАБОТА С БАЗОЙ ДАННЫХ ====================
 class Database:
@@ -37,6 +39,7 @@ class Database:
     async def init_db(self):
         pool = await self.connect()
         async with pool.acquire() as conn:
+            # Таблица пользователей
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     user_id BIGINT PRIMARY KEY,
@@ -46,6 +49,7 @@ class Database:
             """)
             print("✅ Таблица users готова")
 
+            # Таблица настроек серверов
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS guild_config (
                     guild_id BIGINT PRIMARY KEY,
@@ -58,11 +62,15 @@ class Database:
                     message_events BOOLEAN DEFAULT FALSE,
                     command_events BOOLEAN DEFAULT TRUE,
                     telegram_notify_role BOOLEAN DEFAULT FALSE,
-                    telegram_daily_report BOOLEAN DEFAULT TRUE
+                    telegram_daily_report BOOLEAN DEFAULT TRUE,
+                    backup_channel BIGINT,
+                    economy_enabled BOOLEAN DEFAULT TRUE,
+                    achievements_enabled BOOLEAN DEFAULT TRUE
                 )
             """)
             print("✅ Таблица guild_config готова")
 
+            # Таблица предупреждений
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS warns (
                     id SERIAL PRIMARY KEY,
@@ -75,6 +83,7 @@ class Database:
             """)
             print("✅ Таблица warns готова")
 
+            # Таблица уровней
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS levels (
                     user_id BIGINT PRIMARY KEY,
@@ -85,6 +94,7 @@ class Database:
             """)
             print("✅ Таблица levels готова")
 
+            # Таблица истории активности пользователей
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS user_history (
                     id SERIAL PRIMARY KEY,
@@ -98,7 +108,83 @@ class Database:
             """)
             print("✅ Таблица user_history готова")
 
-    # ----- МЕТОДЫ ДЛЯ ПОЛЬЗОВАТЕЛЕЙ -----
+            # ----- НОВОЕ: ТАБЛИЦЫ ДЛЯ ЭКОНОМИКИ -----
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS economy (
+                    user_id BIGINT PRIMARY KEY,
+                    balance BIGINT DEFAULT 0,
+                    total_earned BIGINT DEFAULT 0,
+                    last_daily TIMESTAMP
+                )
+            """)
+            print("✅ Таблица economy готова")
+
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS shop_roles (
+                    id SERIAL PRIMARY KEY,
+                    guild_id BIGINT,
+                    role_id BIGINT,
+                    price BIGINT,
+                    description TEXT,
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            print("✅ Таблица shop_roles готова")
+
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS purchased_roles (
+                    id SERIAL PRIMARY KEY,
+                    guild_id BIGINT,
+                    user_id BIGINT,
+                    role_id BIGINT,
+                    purchased_at TIMESTAMP DEFAULT NOW(),
+                    UNIQUE(guild_id, user_id, role_id)
+                )
+            """)
+            print("✅ Таблица purchased_roles готова")
+
+            # ----- НОВОЕ: ТАБЛИЦЫ ДЛЯ ДОСТИЖЕНИЙ -----
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS achievements (
+                    id SERIAL PRIMARY KEY,
+                    name TEXT UNIQUE,
+                    description TEXT,
+                    xp_reward INT DEFAULT 0,
+                    coin_reward BIGINT DEFAULT 0,
+                    icon TEXT DEFAULT '🏆',
+                    hidden BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            print("✅ Таблица achievements готова")
+
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS user_achievements (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT,
+                    achievement_id INT,
+                    earned_at TIMESTAMP DEFAULT NOW(),
+                    UNIQUE(user_id, achievement_id)
+                )
+            """)
+            print("✅ Таблица user_achievements готова")
+
+            # ----- НОВОЕ: ТАБЛИЦА ДЛЯ СТАТИСТИКИ СЕРВЕРА -----
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS server_history (
+                    id SERIAL PRIMARY KEY,
+                    guild_id BIGINT,
+                    date DATE DEFAULT CURRENT_DATE,
+                    total_messages INT DEFAULT 0,
+                    total_voice_minutes INT DEFAULT 0,
+                    active_users INT DEFAULT 0,
+                    new_members INT DEFAULT 0,
+                    UNIQUE(guild_id, date)
+                )
+            """)
+            print("✅ Таблица server_history готова")
+
+    # ----- СУЩЕСТВУЮЩИЕ МЕТОДЫ (БЕЗ ИЗМЕНЕНИЙ) -----
     async def add_message(self, user_id: int):
         pool = await self.connect()
         async with pool.acquire() as conn:
@@ -278,7 +364,10 @@ class Database:
                     'message_events': False,
                     'command_events': True,
                     'telegram_notify_role': False,
-                    'telegram_daily_report': True
+                    'telegram_daily_report': True,
+                    'backup_channel': None,
+                    'economy_enabled': True,
+                    'achievements_enabled': True
                 }
 
     async def set_log_channel(self, guild_id: int, channel_id: int):
@@ -288,6 +377,15 @@ class Database:
                 INSERT INTO guild_config (guild_id, log_channel)
                 VALUES ($1, $2)
                 ON CONFLICT (guild_id) DO UPDATE SET log_channel = $2
+            """, guild_id, channel_id)
+
+    async def set_backup_channel(self, guild_id: int, channel_id: int):
+        pool = await self.connect()
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO guild_config (guild_id, backup_channel)
+                VALUES ($1, $2)
+                ON CONFLICT (guild_id) DO UPDATE SET backup_channel = $2
             """, guild_id, channel_id)
 
     async def update_guild_config(self, guild_id: int, key: str, value):
@@ -329,6 +427,240 @@ class Database:
         pool = await self.connect()
         async with pool.acquire() as conn:
             await conn.execute("DELETE FROM warns WHERE id = $1", warn_id)
+
+    # ----- НОВОЕ: МЕТОДЫ ДЛЯ ЭКОНОМИКИ -----
+    async def get_balance(self, user_id: int):
+        pool = await self.connect()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT balance FROM economy WHERE user_id = $1",
+                user_id
+            )
+            return row['balance'] if row else 0
+
+    async def add_coins(self, user_id: int, amount: int):
+        pool = await self.connect()
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO economy (user_id, balance, total_earned)
+                VALUES ($1, $2, $2)
+                ON CONFLICT (user_id) DO UPDATE
+                SET balance = economy.balance + $2,
+                    total_earned = economy.total_earned + $2
+            """, user_id, amount)
+
+    async def remove_coins(self, user_id: int, amount: int):
+        pool = await self.connect()
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                UPDATE economy SET balance = balance - $1
+                WHERE user_id = $2 AND balance >= $1
+            """, amount, user_id)
+
+    async def get_eco_top(self, limit: int = 10):
+        pool = await self.connect()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT user_id, balance FROM economy
+                ORDER BY balance DESC LIMIT $1
+            """, limit)
+            return [(row['user_id'], row['balance']) for row in rows]
+
+    # ----- МАГАЗИН РОЛЕЙ -----
+    async def add_shop_role(self, guild_id: int, role_id: int, price: int, description: str = None):
+        pool = await self.connect()
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO shop_roles (guild_id, role_id, price, description)
+                VALUES ($1, $2, $3, $4)
+            """, guild_id, role_id, price, description or "Нет описания")
+
+    async def remove_shop_role(self, role_id: int):
+        pool = await self.connect()
+        async with pool.acquire() as conn:
+            await conn.execute("DELETE FROM shop_roles WHERE role_id = $1", role_id)
+
+    async def get_shop_roles(self, guild_id: int):
+        pool = await self.connect()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT * FROM shop_roles WHERE guild_id = $1 ORDER BY price
+            """, guild_id)
+            return [dict(row) for row in rows]
+
+    async def purchase_role(self, guild_id: int, user_id: int, role_id: int):
+        pool = await self.connect()
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO purchased_roles (guild_id, user_id, role_id)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (guild_id, user_id, role_id) DO NOTHING
+            """, guild_id, user_id, role_id)
+
+    async def has_role_purchased(self, guild_id: int, user_id: int, role_id: int):
+        pool = await self.connect()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT 1 FROM purchased_roles
+                WHERE guild_id = $1 AND user_id = $2 AND role_id = $3
+            """, guild_id, user_id, role_id)
+            return row is not None
+
+    # ----- НОВОЕ: МЕТОДЫ ДЛЯ ДОСТИЖЕНИЙ -----
+    async def init_achievements(self):
+        """Инициализирует базовый список достижений"""
+        achievements = [
+            ("chat_100", "Пиздaбoл", "Написать 100 сообщений", 50, 100, "💬"),
+            ("chat_1000", "Графоман", "Написать 1000 сообщений", 200, 500, "📝"),
+            ("voice_10h", "Микро...селебрити", "Провести 10 часов в голосовом канале", 50, 100, "🎤"),
+            ("voice_100h", "Диктор Саша", "Провести 100 часов в голосовом канале", 200, 500, "📻"),
+            ("level_5", "Мдэ", "Достичь 5 уровня", 0, 0, "🌱"),
+            ("level_10", "Пикабушник", "Достичь 10 уровня", 0, 0, "🌿"),
+            ("level_20", "Ньюдвачер", "Достичь 20 уровня", 0, 0, "⭐"),
+            ("level_30", "Олд", "Достичь 30 уровня", 0, 0, "💎"),
+            ("level_50", "Ничанер-придурок", "Достичь 50 уровня", 0, 0, "👑"),
+            ("first_warning", "Рома дал этому доходяге по eбaлy", "Получить первое предупреждение", 0, -50, "⚠️"),
+            ("first_purchase", "Шопинг для гeeв", "Купить первую роль в магазине", 20, 0, "🛒"),
+        ]
+        pool = await self.connect()
+        async with pool.acquire() as conn:
+            for name, title, desc, xp, coins, icon in achievements:
+                await conn.execute("""
+                    INSERT INTO achievements (name, description, xp_reward, coin_reward, icon)
+                    VALUES ($1, $2, $3, $4, $5)
+                    ON CONFLICT (name) DO UPDATE
+                    SET description = EXCLUDED.description,
+                        xp_reward = EXCLUDED.xp_reward,
+                        coin_reward = EXCLUDED.coin_reward,
+                        icon = EXCLUDED.icon
+                """, name, f"{title}: {desc}", xp, coins, icon)
+        print("✅ Достижения инициализированы")
+
+    async def check_achievement(self, user_id: int, achievement_name: str, guild: discord.Guild = None):
+        """Проверяет, получено ли достижение, и выдаёт награду"""
+        pool = await self.connect()
+        async with pool.acquire() as conn:
+            # Получаем ID достижения
+            ach = await conn.fetchrow(
+                "SELECT id, xp_reward, coin_reward, icon, description FROM achievements WHERE name = $1",
+                achievement_name
+            )
+            if not ach:
+                return False
+
+            # Проверяем, не получено ли уже
+            earned = await conn.fetchval(
+                "SELECT 1 FROM user_achievements WHERE user_id = $1 AND achievement_id = $2",
+                user_id, ach['id']
+            )
+            if earned:
+                return False
+
+            # Выдаём достижение
+            await conn.execute("""
+                INSERT INTO user_achievements (user_id, achievement_id)
+                VALUES ($1, $2)
+            """, user_id, ach['id'])
+
+            # Награды: опыт и монеты
+            if ach['xp_reward'] > 0:
+                await self.add_xp(user_id, ach['xp_reward'])
+            if ach['coin_reward'] > 0:
+                await self.add_coins(user_id, ach['coin_reward'])
+            elif ach['coin_reward'] < 0:
+                await self.remove_coins(user_id, -ach['coin_reward'])
+
+            # Логирование и уведомление
+            if guild:
+                config = await self.get_guild_config(guild.id)
+                if config.get('log_channel'):
+                    await Logger.log_event(
+                        guild=guild,
+                        event_type="achievement",
+                        title="🏆 Получено достижение",
+                        description=f"{ach['icon']} **{ach['description']}**",
+                        color=0xffd700,
+                        user=discord.utils.get(guild.members, id=user_id),
+                        fields={
+                            "Опыт": f"+{ach['xp_reward']}" if ach['xp_reward'] else "0",
+                            "Монеты": f"+{ach['coin_reward']}" if ach['coin_reward'] else "0"
+                        }
+                    )
+            return True
+
+    async def get_user_achievements(self, user_id: int):
+        pool = await self.connect()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT a.id, a.name, a.description, a.icon, ua.earned_at
+                FROM user_achievements ua
+                JOIN achievements a ON ua.achievement_id = a.id
+                WHERE ua.user_id = $1
+                ORDER BY ua.earned_at DESC
+            """, user_id)
+            return [dict(row) for row in rows]
+
+    async def get_all_achievements(self):
+        pool = await self.connect()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT * FROM achievements ORDER BY id
+            """)
+            return [dict(row) for row in rows]
+
+    # ----- НОВОЕ: СТАТИСТИКА СЕРВЕРА -----
+    async def save_server_stats(self, guild_id: int, date: datetime.date = None):
+        """Собирает и сохраняет дневную статистику сервера"""
+        if date is None:
+            date = datetime.date.today()
+
+        pool = await self.connect()
+        async with pool.acquire() as conn:
+            # Получаем статистику пользователей сервера
+            guild = bot.get_guild(guild_id)
+            if not guild:
+                return
+
+            total_messages = 0
+            total_voice = 0
+            active_users = 0
+
+            for member in guild.members:
+                if member.bot:
+                    continue
+                stats = await self.get_user_stats(member.id)
+                total_messages += stats['messages']
+                total_voice += stats['voice_minutes']
+                if stats['messages'] > 0 or stats['voice_minutes'] > 0:
+                    active_users += 1
+
+            # Получаем количество новых участников за день
+            new_members = 0
+            for member in guild.members:
+                if member.joined_at and member.joined_at.date() == date:
+                    new_members += 1
+
+            await conn.execute("""
+                INSERT INTO server_history (guild_id, date, total_messages, total_voice_minutes, active_users, new_members)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (guild_id, date) DO UPDATE
+                SET total_messages = EXCLUDED.total_messages,
+                    total_voice_minutes = EXCLUDED.total_voice_minutes,
+                    active_users = EXCLUDED.active_users,
+                    new_members = EXCLUDED.new_members
+            """, guild_id, date, total_messages, total_voice, active_users, new_members)
+
+    async def get_server_stats(self, guild_id: int, days: int = 7):
+        """Возвращает статистику сервера за последние N дней"""
+        pool = await self.connect()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT * FROM server_history
+                WHERE guild_id = $1
+                ORDER BY date DESC
+                LIMIT $2
+            """, guild_id, days)
+            return [dict(row) for row in rows]
 
 db = Database()
 
@@ -418,6 +750,18 @@ class TelegramBot:
             print(f"❌ Telegram send error: {e}")
             return False
 
+    async def send_document(self, file_path: str, caption: str = "") -> bool:
+        if not self.enabled:
+            return False
+        await self.ensure_session()
+        with open(file_path, 'rb') as f:
+            data = aiohttp.FormData()
+            data.add_field('chat_id', self.chat_id)
+            data.add_field('caption', caption)
+            data.add_field('document', f, filename=os.path.basename(file_path))
+            async with self.session.post(f"{self.base_url}/sendDocument", data=data) as resp:
+                return resp.status == 200
+
     async def send_stats(self) -> bool:
         if not self.enabled:
             return False
@@ -502,6 +846,7 @@ class TelegramBot:
                 "• `/stats` — статистика бота\n"
                 "• `/top` — топ пользователей\n"
                 "• `/roles` — список ролей по уровням\n"
+                "• `/eco_top` — топ богачей\n"
                 "• `/help` — помощь"
             )
         elif text == "/stats":
@@ -520,12 +865,19 @@ class TelegramBot:
             for level, role in LEVEL_ROLES.items():
                 lines.append(f"**Уровень {level}** — {role}")
             await self.send_message("\n".join(lines))
+        elif text == "/eco_top":
+            top = await db.get_eco_top(5)
+            lines = ["💰 *Топ по монетам:*"]
+            for i, (uid, balance) in enumerate(top, 1):
+                lines.append(f"{i}. ID `{uid}` — {balance} 🪙")
+            await self.send_message("\n".join(lines))
         elif text == "/help":
             await self.send_message(
                 "📚 *Команды Telegram:*\n\n"
                 "`/stats` — статистика бота\n"
                 "`/top` — топ пользователей\n"
                 "`/roles` — список ролей\n"
+                "`/eco_top` — топ богачей\n"
                 "`/help` — это сообщение"
             )
 
@@ -570,12 +922,21 @@ async def set_log_channel(guild_id: int, channel_id: int):
         config['log_channel'] = channel_id
         guild_config_cache[guild_id] = config
 
+async def set_backup_channel(guild_id: int, channel_id: int):
+    await db.set_backup_channel(guild_id, channel_id)
+    if guild_id in guild_config_cache:
+        guild_config_cache[guild_id]['backup_channel'] = channel_id
+    else:
+        config = await db.get_guild_config(guild_id)
+        config['backup_channel'] = channel_id
+        guild_config_cache[guild_id] = config
+
 # ==================== ЛОГГЕР ====================
 class Logger:
     @staticmethod
     async def log_event(guild: discord.Guild, event_type: str, title: str, description: str,
                        color: int = None, fields: Dict = None, user: discord.Member = None,
-                       channel: discord.abc.GuildChannel = None) -> None:
+                       target: discord.Member = None, channel: discord.abc.GuildChannel = None) -> None:
         try:
             config = await get_guild_config(guild.id)
             log_channel_id = config.get('log_channel')
@@ -590,7 +951,9 @@ class Logger:
                 "voice": "voice_events", "role": "role_events",
                 "member": "member_events", "channel": "channel_events",
                 "server": "server_events", "message": "message_events",
-                "command": "command_events"
+                "command": "command_events",
+                "achievement": "role_events",   # используем role_events или отдельный ключ
+                "economy": "command_events"
             }
             if event_type in config_keys and not config.get(config_keys[event_type], True):
                 return
@@ -598,7 +961,7 @@ class Logger:
             color_map = {
                 "voice": 0x3498db, "role": 0x2ecc71, "member": 0xe67e22,
                 "channel": 0x9b59b6, "server": 0xe74c3c, "command": 0x1abc9c,
-                "message": 0x95a5a6
+                "message": 0x95a5a6, "achievement": 0xffd700, "economy": 0xf1c40f
             }
 
             embed = discord.Embed(
@@ -610,7 +973,8 @@ class Logger:
 
             event_icons = {
                 "voice": "🎤", "role": "👑", "member": "👤", "channel": "📺",
-                "server": "🏠", "command": "⚙️", "message": "💬"
+                "server": "🏠", "command": "⚙️", "message": "💬",
+                "achievement": "🏆", "economy": "💰"
             }
 
             embed.set_author(
@@ -622,6 +986,10 @@ class Logger:
                 embed.add_field(name="👤 Пользователь",
                               value=f"{user.mention}\nID: `{user.id}`", inline=True)
                 embed.set_thumbnail(url=user.display_avatar.url)
+
+            if target:
+                embed.add_field(name="🎯 Цель",
+                              value=f"{target.mention}\nID: `{target.id}`", inline=True)
 
             if channel:
                 embed.add_field(name="📺 Канал",
@@ -785,6 +1153,8 @@ async def check_voice_time():
                 member = guild.get_member(member_id)
                 if member and member.voice and member.voice.channel:
                     await db.add_voice_time(member_id, 5)
+                    # Монеты за голос (1 монета за 5 минут)
+                    await db.add_coins(member_id, 1)
                     leveled_up, new_level = await db.add_xp(member_id, 10)
                     if leveled_up:
                         try:
@@ -869,10 +1239,66 @@ async def collect_stats():
                     stats['voice_minutes'],
                     stats['messages']
                 )
+            # Статистика сервера
+            await db.save_server_stats(guild.id)
             print(f"   ✅ {guild.name}: статистика сохранена")
         print("✅ Дневная статистика успешно собрана")
     except Exception as e:
         print(f"❌ Ошибка сбора статистики: {e}")
+
+# ----- НОВОЕ: АВТОБЭКАП БД В TELEGRAM -----
+@tasks.loop(time=datetime_time(hour=3, minute=0))
+async def backup_db():
+    """Ежедневный бэкап базы данных в Telegram"""
+    if not telegram.enabled:
+        return
+    try:
+        # Проверяем наличие pg_dump
+        pg_dump_path = subprocess.run(["which", "pg_dump"], capture_output=True, text=True).stdout.strip()
+        if not pg_dump_path:
+            print("⚠️ pg_dump не найден, пропускаем бэкап")
+            return
+
+        db_url = os.environ.get("DATABASE_URL")
+        if not db_url:
+            return
+
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"backup_{timestamp}.sql"
+
+        result = subprocess.run(
+            ["pg_dump", db_url, "-f", filename],
+            capture_output=True,
+            text=True
+        )
+
+        if result.returncode == 0:
+            # Отправляем в Telegram
+            await telegram.send_document(filename, f"📦 Ежедневный бэкап БД\n⏰ {format_moscow_time()}")
+            os.remove(filename)
+            print(f"✅ Бэкап отправлен в Telegram: {filename}")
+
+            # Также отправляем в канал логов, если указан
+            for guild in bot.guilds:
+                config = await get_guild_config(guild.id)
+                if config.get('backup_channel'):
+                    channel = guild.get_channel(config['backup_channel'])
+                    if channel and channel.permissions_for(guild.me).send_messages:
+                        with open(filename, 'rb') as f:
+                            await channel.send(
+                                f"📦 **Бэкап базы данных**\n⏰ {format_moscow_time()}",
+                                file=discord.File(f, filename)
+                            )
+                        break
+        else:
+            print(f"❌ Ошибка pg_dump: {result.stderr}")
+
+    except Exception as e:
+        print(f"❌ Ошибка бэкапа: {e}")
+
+@backup_db.before_loop
+async def before_backup():
+    await bot.wait_until_ready()
 
 # ==================== СОБЫТИЯ DISCORD ====================
 @bot.event
@@ -881,10 +1307,12 @@ async def on_ready():
     print(f"📊 Серверов: {len(bot.guilds)}")
 
     await db.init_db()
+    await db.init_achievements()  # Инициализация достижений
     print("✅ База данных подключена")
     print(f"🐍 Python: {sys.version}")
     print(f"📱 Telegram: {'✅' if telegram.enabled else '❌'}")
 
+    # Очистка старых слэш-команд
     try:
         bot.tree.clear_commands(guild=None)
         await bot.tree.sync()
@@ -895,6 +1323,7 @@ async def on_ready():
     except Exception as e:
         print(f"⚠️ Ошибка очистки команд: {e}")
 
+    # Запуск задач
     if not check_voice_time.is_running():
         check_voice_time.start()
         print("⏱️ Запущена проверка голосового времени")
@@ -909,13 +1338,18 @@ async def on_ready():
     if not collect_stats.is_running():
         collect_stats.start()
         print("📊 Запущен сбор дневной статистики")
+    if telegram.enabled and not backup_db.is_running():
+        backup_db.start()
+        print("💾 Запущен ежедневный бэкап БД")
 
+    # Создаём роли уровней на всех серверах
     for guild in bot.guilds:
         print(f"\n🔍 Сервер: {guild.name}")
         await RoleManager.ensure_role_exists(guild, DEFAULT_ROLE_NAME)
         for role_name in LEVEL_ROLES.values():
             await RoleManager.ensure_role_exists(guild, role_name)
 
+    # Выдаём начальные роли всем участникам
     print("\n🎯 Выдача начальных ролей...")
     for guild in bot.guilds:
         members = [m for m in guild.members if not m.bot]
@@ -925,6 +1359,7 @@ async def on_ready():
             await asyncio.sleep(0.05)
     print("✅ Начальная выдача ролей завершена!")
 
+    # Логирование запуска
     for guild in bot.guilds:
         await Logger.log_event(
             guild=guild,
@@ -1011,16 +1446,39 @@ async def on_message(message):
         return
     if not message.content.startswith('!'):
         await db.add_message(message.author.id)
+        # Монеты за сообщение (2 монеты)
+        await db.add_coins(message.author.id, 2)
         leveled_up, new_level = await db.add_xp(message.author.id, 5)
         if leveled_up:
             try:
                 await message.author.send(f"🎉 Поздравляю! Вы достигли **{new_level} уровня**!")
             except:
                 pass
-            if isinstance(message.author, discord.Member):
-                await RoleManager.check_and_give_roles(message.author)
+            await RoleManager.check_and_give_roles(message.author)
         if isinstance(message.author, discord.Member):
             await RoleManager.check_and_give_roles(message.author)
+
+        # Проверка достижений
+        if message.author.id:
+            stats = await db.get_user_stats(message.author.id)
+            level_info = await db.get_level_info(message.author.id)
+            # За сообщения
+            if stats['messages'] >= 100:
+                await db.check_achievement(message.author.id, "chat_100", message.guild)
+            if stats['messages'] >= 1000:
+                await db.check_achievement(message.author.id, "chat_1000", message.guild)
+            # За уровень
+            if level_info['level'] >= 5:
+                await db.check_achievement(message.author.id, "level_5", message.guild)
+            if level_info['level'] >= 10:
+                await db.check_achievement(message.author.id, "level_10", message.guild)
+            if level_info['level'] >= 20:
+                await db.check_achievement(message.author.id, "level_20", message.guild)
+            if level_info['level'] >= 30:
+                await db.check_achievement(message.author.id, "level_30", message.guild)
+            if level_info['level'] >= 50:
+                await db.check_achievement(message.author.id, "level_50", message.guild)
+
     await bot.process_commands(message)
 
 @bot.event
@@ -1095,6 +1553,10 @@ async def on_voice_state_update(member, before, after):
             duration = (now - voice_sessions[user_id]).total_seconds() / 60
             if duration >= 1:
                 await db.add_voice_time(member.id, int(duration))
+                # Монеты за голос (1 монета за 5 минут)
+                coin_gain = int(duration) // 5
+                if coin_gain > 0:
+                    await db.add_coins(member.id, coin_gain)
                 xp_gain = int(duration) * 2
                 leveled_up, new_level = await db.add_xp(member.id, xp_gain)
                 if leveled_up:
@@ -1104,6 +1566,14 @@ async def on_voice_state_update(member, before, after):
                         pass
                     await RoleManager.check_and_give_roles(member)
                 await RoleManager.check_and_give_roles(member)
+
+                # Проверка достижений за голос
+                stats = await db.get_user_stats(member.id)
+                if stats['voice_minutes'] >= 600:  # 10 часов
+                    await db.check_achievement(member.id, "voice_10h", member.guild)
+                if stats['voice_minutes'] >= 6000:  # 100 часов
+                    await db.check_achievement(member.id, "voice_100h", member.guild)
+
                 config = await get_guild_config(member.guild.id)
                 if config.get("voice_events", True):
                     await Logger.log_event(
@@ -1116,7 +1586,8 @@ async def on_voice_state_update(member, before, after):
                         channel=before.channel,
                         fields={
                             "Канал": before.channel.name,
-                            "Время в канале": f"{int(duration)} минут"
+                            "Время в канале": f"{int(duration)} минут",
+                            "Монеты": f"+{coin_gain}" if coin_gain else "0"
                         }
                     )
             del voice_sessions[user_id]
@@ -1126,6 +1597,9 @@ async def on_voice_state_update(member, before, after):
             duration = (now - voice_sessions[user_id]).total_seconds() / 60
             if duration >= 1:
                 await db.add_voice_time(member.id, int(duration))
+                coin_gain = int(duration) // 5
+                if coin_gain > 0:
+                    await db.add_coins(member.id, coin_gain)
                 xp_gain = int(duration) * 2
                 leveled_up, new_level = await db.add_xp(member.id, xp_gain)
                 if leveled_up:
@@ -1192,6 +1666,7 @@ async def stats(ctx, member: discord.Member = None):
         member = ctx.author
     data = await db.get_user_stats(member.id)
     level_info = await db.get_level_info(member.id)
+    balance = await db.get_balance(member.id)
 
     embed = discord.Embed(
         title=f"📊 Статистика {member.display_name}",
@@ -1211,6 +1686,11 @@ async def stats(ctx, member: discord.Member = None):
     embed.add_field(
         name="📈 Уровень",
         value=f"**{level_info['level']}** (✨ {level_info['xp']} XP)",
+        inline=True
+    )
+    embed.add_field(
+        name="💰 Монеты",
+        value=f"**{balance}** 🪙",
         inline=True
     )
 
@@ -1340,106 +1820,233 @@ async def activity_graph(ctx, member: discord.Member = None):
 
     await ctx.send(embed=embed, file=file)
 
-# ---- НОВОЕ: КОМАНДА ДЛЯ ТАЙМ-АУТОВ ЧЕРЕЗ КНОПКИ ----
-class TimeoutView(View):
-    def __init__(self, member: discord.Member, moderator: discord.Member):
-        super().__init__(timeout=60)
-        self.member = member
-        self.moderator = moderator
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        return interaction.user == self.moderator
-
-    @discord.ui.button(label="10 минут", style=discord.ButtonStyle.danger)
-    async def timeout_10m(self, button: Button, interaction: discord.Interaction):
-        await self.apply_timeout(datetime.timedelta(minutes=10), interaction)
-
-    @discord.ui.button(label="1 час", style=discord.ButtonStyle.danger)
-    async def timeout_1h(self, button: Button, interaction: discord.Interaction):
-        await self.apply_timeout(datetime.timedelta(hours=1), interaction)
-
-    @discord.ui.button(label="6 часов", style=discord.ButtonStyle.danger)
-    async def timeout_6h(self, button: Button, interaction: discord.Interaction):
-        await self.apply_timeout(datetime.timedelta(hours=6), interaction)
-
-    @discord.ui.button(label="1 день", style=discord.ButtonStyle.danger)
-    async def timeout_1d(self, button: Button, interaction: discord.Interaction):
-        await self.apply_timeout(datetime.timedelta(days=1), interaction)
-
-    @discord.ui.button(label="Отмена", style=discord.ButtonStyle.secondary)
-    async def cancel(self, button: Button, interaction: discord.Interaction):
-        await interaction.response.edit_message(content="❌ Операция отменена.", view=None)
-        self.stop()
-
-    async def apply_timeout(self, delta: datetime.timedelta, interaction: discord.Interaction):
-        try:
-            await self.member.timeout(delta, reason=f"Тайм-аут от {self.moderator}")
-            await interaction.response.edit_message(
-                content=f"✅ {self.member.mention} получил тайм-аут на {delta}.",
-                view=None
-            )
-            # Логирование
-            await Logger.log_event(
-                guild=interaction.guild,
-                event_type="command",
-                title="Тайм-аут",
-                description=f"{self.moderator.mention} выдал тайм-аут {self.member.mention} на {delta}",
-                color=0xe74c3c,
-                user=self.moderator,
-                target=self.member
-            )
-        except discord.Forbidden:
-            await interaction.response.edit_message(
-                content="❌ У меня недостаточно прав для тайм-аута.",
-                view=None
-            )
-        self.stop()
-
-@bot.command(name="timeout", aliases=["таймаут"])
-@commands.has_permissions(moderate_members=True)
-async def timeout(ctx, member: discord.Member):
-    """Выдать тайм-аут с выбором длительности через кнопки"""
-    if member.top_role >= ctx.author.top_role and ctx.author != ctx.guild.owner:
-        await ctx.send("❌ Вы не можете затаймаутить этого пользователя.")
-        return
-    if not ctx.guild.me.guild_permissions.moderate_members:
-        await ctx.send("❌ У меня нет прав на выдачу тайм-аута.")
-        return
-
-    view = TimeoutView(member, ctx.author)
-    await ctx.send(
-        f"🕒 Выберите длительность тайм-аута для {member.mention}:",
-        view=view
+# ---- НОВОЕ: ЭКОНОМИКА И МАГАЗИН РОЛЕЙ ----
+@bot.command(name="баланс", aliases=["money", "coins"])
+async def balance(ctx, member: discord.Member = None):
+    """Показывает баланс монет пользователя"""
+    if member is None:
+        member = ctx.author
+    balance = await db.get_balance(member.id)
+    embed = discord.Embed(
+        title=f"💰 Баланс {member.display_name}",
+        description=f"**{balance}** 🪙",
+        color=discord.Color.gold(),
+        timestamp=get_moscow_time()
     )
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.set_footer(text=f"ID: {member.id} • Время МСК")
+    await ctx.send(embed=embed)
 
-# ---- НОВОЕ: КОМАНДА ДЛЯ ОЧИСТКИ СООБЩЕНИЙ ----
-@bot.command(name="clear", aliases=["очистить"])
-@commands.has_permissions(manage_messages=True)
-async def clear(ctx, amount: int):
-    """Удалить указанное количество сообщений (макс. 100)"""
-    if amount <= 0:
-        await ctx.send("❌ Укажите положительное число.")
-        return
-    amount = min(amount, 100)
-    deleted = await ctx.channel.purge(limit=amount + 1)
-    count = len(deleted) - 1  # минус команда
-    await ctx.send(f"✅ Удалено {count} сообщений.", delete_after=5)
-    await Logger.log_event(
-        guild=ctx.guild,
-        event_type="command",
-        title="Очистка сообщений",
-        description=f"{ctx.author.mention} удалил {count} сообщений в {ctx.channel.mention}",
-        color=0x3498db,
-        user=ctx.author,
-        channel=ctx.channel
+@bot.command(name="топ_монет", aliases=["topcoins", "topmoney"])
+async def top_coins(ctx):
+    """Топ пользователей по монетам"""
+    top = await db.get_eco_top(10)
+    embed = discord.Embed(
+        title="💰 Топ по монетам",
+        color=discord.Color.gold(),
+        timestamp=get_moscow_time()
     )
+    text = ""
+    for i, (uid, balance) in enumerate(top[:5], 1):
+        user = ctx.guild.get_member(uid)
+        name = user.display_name if user else f"ID: {uid}"
+        text += f"{i}. **{name}** — {balance} 🪙\n"
+    embed.add_field(name="Топ 5 богачей", value=text or "Нет данных", inline=False)
+    embed.set_footer(text="Монеты зарабатываются за активность")
+    await ctx.send(embed=embed)
 
-@clear.error
-async def clear_error(ctx, error):
-    if isinstance(error, commands.BadArgument):
-        await ctx.send("❌ Укажите число сообщений для удаления (например: `!clear 10`).")
+@bot.command(name="магазин", aliases=["shop"])
+@commands.has_permissions(administrator=True)
+async def shop(ctx):
+    """Показать список ролей в магазине"""
+    roles = await db.get_shop_roles(ctx.guild.id)
+    if not roles:
+        await ctx.send("🛒 Магазин пуст. Администратор может добавить роли через `!добавить_роль`.")
+        return
 
-# ---- ЛОГИРОВАНИЕ, НАСТРОЙКИ, ПРЕДУПРЕЖДЕНИЯ, TELEGRAM ----
+    embed = discord.Embed(
+        title="🛒 Магазин ролей",
+        description="Купите роль с помощью `!купить <название_роли>`",
+        color=discord.Color.blue(),
+        timestamp=get_moscow_time()
+    )
+    for item in roles:
+        role = ctx.guild.get_role(item['role_id'])
+        if role:
+            embed.add_field(
+                name=f"{role.name}",
+                value=f"**Цена:** {item['price']} 🪙\n{item['description']}\nID: `{item['role_id']}`",
+                inline=False
+            )
+    embed.set_footer(text="Роль выдаётся навсегда")
+    await ctx.send(embed=embed)
+
+@bot.command(name="добавить_роль")
+@commands.has_permissions(administrator=True)
+async def add_shop_role(ctx, role: discord.Role, price: int, *, description: str = None):
+    """Добавить роль в магазин (только админ)"""
+    if not await RoleManager.check_hierarchy(ctx.guild, role):
+        await ctx.send("❌ Я не могу выдавать эту роль (она выше моей).")
+        return
+
+    await db.add_shop_role(ctx.guild.id, role.id, price, description)
+    await ctx.send(f"✅ Роль **{role.name}** добавлена в магазин за {price} 🪙")
+
+@bot.command(name="удалить_роль")
+@commands.has_permissions(administrator=True)
+async def remove_shop_role(ctx, role: discord.Role):
+    """Удалить роль из магазина (только админ)"""
+    await db.remove_shop_role(role.id)
+    await ctx.send(f"✅ Роль **{role.name}** удалена из магазина")
+
+@bot.command(name="купить")
+async def buy_role(ctx, *, role_name: str):
+    """Купить роль из магазина"""
+    role = discord.utils.get(ctx.guild.roles, name=role_name)
+    if not role:
+        await ctx.send("❌ Роль не найдена.")
+        return
+
+    # Проверяем, есть ли в магазине
+    shop_roles = await db.get_shop_roles(ctx.guild.id)
+    shop_item = None
+    for item in shop_roles:
+        if item['role_id'] == role.id:
+            shop_item = item
+            break
+
+    if not shop_item:
+        await ctx.send("❌ Эта роль не продаётся в магазине.")
+        return
+
+    # Проверяем баланс
+    balance = await db.get_balance(ctx.author.id)
+    if balance < shop_item['price']:
+        await ctx.send(f"❌ Недостаточно монет! Нужно {shop_item['price']} 🪙, у вас {balance} 🪙.")
+        return
+
+    # Проверяем, не куплена ли уже
+    if await db.has_role_purchased(ctx.guild.id, ctx.author.id, role.id):
+        await ctx.send("❌ Вы уже купили эту роль.")
+        return
+
+    # Снимаем монеты
+    await db.remove_coins(ctx.author.id, shop_item['price'])
+    await db.purchase_role(ctx.guild.id, ctx.author.id, role.id)
+
+    # Выдаём роль
+    try:
+        await ctx.author.add_roles(role, reason="Покупка в магазине")
+        await ctx.send(f"✅ Поздравляем! Вы купили роль **{role.name}** за {shop_item['price']} 🪙!")
+
+        # Достижение за первую покупку
+        await db.check_achievement(ctx.author.id, "first_purchase", ctx.guild)
+
+        await Logger.log_event(
+            guild=ctx.guild,
+            event_type="economy",
+            title="Покупка в магазине",
+            description=f"{ctx.author.mention} купил роль **{role.name}**",
+            color=0xf1c40f,
+            user=ctx.author,
+            fields={"Цена": f"{shop_item['price']} 🪙"}
+        )
+    except discord.Forbidden:
+        await ctx.send("❌ Не удалось выдать роль (недостаточно прав).")
+        await db.add_coins(ctx.author.id, shop_item['price'])  # Возвращаем монеты
+
+# ---- НОВОЕ: ДОСТИЖЕНИЯ ----
+@bot.command(name="достижения", aliases=["achievements", "ach"])
+async def achievements(ctx, member: discord.Member = None):
+    """Показать полученные достижения пользователя"""
+    if member is None:
+        member = ctx.author
+
+    user_achs = await db.get_user_achievements(member.id)
+    all_achs = await db.get_all_achievements()
+
+    embed = discord.Embed(
+        title=f"🏆 Достижения {member.display_name}",
+        color=discord.Color.gold(),
+        timestamp=get_moscow_time()
+    )
+    embed.set_thumbnail(url=member.display_avatar.url)
+
+    if user_achs:
+        text = ""
+        for ach in user_achs[:10]:
+            text += f"{ach['icon']} **{ach['description']}** — {ach['earned_at'].strftime('%d.%m.%Y')}\n"
+        embed.add_field(name="Полученные", value=text, inline=False)
+    else:
+        embed.add_field(name="Полученные", value="Пока нет достижений", inline=False)
+
+    # Статистика
+    unlocked = len(user_achs)
+    total = len(all_achs)
+    embed.set_footer(text=f"Прогресс: {unlocked}/{total} • Время МСК")
+
+    await ctx.send(embed=embed)
+
+@bot.command(name="все_достижения", aliases=["allach"])
+async def all_achievements(ctx):
+    """Показать список всех достижений"""
+    all_achs = await db.get_all_achievements()
+    embed = discord.Embed(
+        title="🏆 Все достижения",
+        description="Получайте награды за активность!",
+        color=discord.Color.gold(),
+        timestamp=get_moscow_time()
+    )
+    text = ""
+    for ach in all_achs:
+        text += f"{ach['icon']} **{ach['description']}**\n"
+        if ach['xp_reward'] > 0 or ach['coin_reward'] != 0:
+            text += f"└ Награда: {ach['xp_reward']} XP, {ach['coin_reward']} 🪙\n"
+    embed.add_field(name="Список", value=text, inline=False)
+    embed.set_footer(text=f"Всего: {len(all_achs)} • Время МСК")
+    await ctx.send(embed=embed)
+
+# ---- НОВОЕ: СТАТИСТИКА СЕРВЕРА ----
+@bot.command(name="сервер_статистика", aliases=["serverstats", "ss"])
+@commands.has_permissions(administrator=True)
+async def server_stats(ctx, period: str = "week"):
+    """Показать статистику сервера за период (day/week/month/all)"""
+    days_map = {
+        "day": 1,
+        "week": 7,
+        "month": 30,
+        "all": 3650
+    }
+    days = days_map.get(period, 7)
+
+    stats = await db.get_server_stats(ctx.guild.id, days)
+    if not stats:
+        await ctx.send("❌ Недостаточно данных для статистики.")
+        return
+
+    total_messages = sum(s['total_messages'] for s in stats)
+    total_voice = sum(s['total_voice_minutes'] for s in stats)
+    avg_active = sum(s['active_users'] for s in stats) // len(stats)
+    total_new = sum(s['new_members'] for s in stats)
+
+    embed = discord.Embed(
+        title=f"📊 Статистика сервера {ctx.guild.name}",
+        description=f"За последние {days} дней" if period != "all" else "За всё время",
+        color=discord.Color.blue(),
+        timestamp=get_moscow_time()
+    )
+    embed.add_field(name="💬 Сообщений", value=f"{total_messages}", inline=True)
+    embed.add_field(name="🎤 Часов в голосе", value=f"{total_voice // 60}", inline=True)
+    embed.add_field(name="👥 Активных (в среднем)", value=f"{avg_active}", inline=True)
+    embed.add_field(name="👋 Новых участников", value=f"{total_new}", inline=True)
+
+    if ctx.guild.icon:
+        embed.set_thumbnail(url=ctx.guild.icon.url)
+
+    embed.set_footer(text=f"ID: {ctx.guild.id} • Время МСК")
+    await ctx.send(embed=embed)
+
+# ---- СУЩЕСТВУЮЩИЕ КОМАНДЫ ЛОГИРОВАНИЯ И Т.Д. ----
 @bot.command(name="логи")
 @commands.has_permissions(administrator=True)
 async def logs(ctx, target_channel: discord.TextChannel = None):
@@ -1480,7 +2087,7 @@ async def logs(ctx, target_channel: discord.TextChannel = None):
 
         config_text = ""
         for key, value in config.items():
-            if key not in ['guild_id', 'log_channel'] and not key.startswith('telegram'):
+            if key not in ['guild_id', 'log_channel', 'backup_channel'] and not key.startswith('telegram'):
                 emoji = '✅' if value else '❌'
                 config_text += f"• **{key.replace('_', ' ').title()}:** {emoji}\n"
         embed.add_field(name="⚙️ Конфигурация", value=config_text, inline=False)
@@ -1522,13 +2129,14 @@ async def log_settings(ctx, event_type: str = None, status: str = None):
         for key, value in config.items():
             if key in ['voice_events', 'role_events', 'member_events', 
                       'channel_events', 'server_events', 'message_events', 
-                      'command_events', 'telegram_notify_role', 'telegram_daily_report']:
+                      'command_events', 'telegram_notify_role', 'telegram_daily_report',
+                      'economy_enabled', 'achievements_enabled']:
                 emoji = '✅ Вкл' if value else '❌ Выкл'
                 config_text += f"• **{key}:** {emoji}\n"
         embed.add_field(name="Текущие настройки", value=config_text, inline=False)
         embed.add_field(
             name="📝 Доступные типы",
-            value="`voice_events`, `role_events`, `member_events`, `channel_events`, `server_events`, `message_events`, `command_events`",
+            value="`voice_events`, `role_events`, `member_events`, `channel_events`, `server_events`, `message_events`, `command_events`, `telegram_notify_role`, `telegram_daily_report`, `economy_enabled`, `achievements_enabled`",
             inline=False
         )
         embed.set_footer(text="Используйте: !настройки_логов [тип] [on/off]")
@@ -1545,6 +2153,206 @@ async def log_settings(ctx, event_type: str = None, status: str = None):
     await update_guild_config(ctx.guild.id, event_type, new_value)
     await ctx.send(f"✅ {event_type} теперь {'включен' if new_value else 'выключен'}")
 
+@bot.command(name="бэкап_канал")
+@commands.has_permissions(administrator=True)
+async def backup_channel(ctx, channel: discord.TextChannel = None):
+    """Установить канал для автоматических бэкапов БД"""
+    if channel:
+        await set_backup_channel(ctx.guild.id, channel.id)
+        await ctx.send(f"✅ Канал для бэкапов установлен: {channel.mention}")
+    else:
+        config = await get_guild_config(ctx.guild.id)
+        ch_id = config.get('backup_channel')
+        if ch_id:
+            ch = ctx.guild.get_channel(ch_id)
+            await ctx.send(f"📦 Канал для бэкапов: {ch.mention if ch else 'не найден'}")
+        else:
+            await ctx.send("❌ Канал для бэкапов не установлен.")
+
+@bot.command(name="ручной_бэкап")
+@commands.has_permissions(administrator=True)
+async def manual_backup(ctx):
+    """Создать бэкап БД вручную"""
+    if not telegram.enabled:
+        await ctx.send("❌ Telegram не настроен, бэкап невозможен.")
+        return
+    await ctx.send("⏳ Создаю бэкап...")
+    await backup_db()  # вызываем задачу
+    await ctx.send("✅ Бэкап создан и отправлен в Telegram.")
+
+# ---- ТАЙМ-АУТЫ И ОЧИСТКА ----
+class TimeoutView(View):
+    def __init__(self, member: discord.Member, moderator: discord.Member):
+        super().__init__(timeout=60)
+        self.member = member
+        self.moderator = moderator
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return interaction.user == self.moderator
+
+    @discord.ui.button(label="10 минут", style=discord.ButtonStyle.danger)
+    async def timeout_10m(self, button: Button, interaction: discord.Interaction):
+        await self.apply_timeout(datetime.timedelta(minutes=10), interaction)
+
+    @discord.ui.button(label="1 час", style=discord.ButtonStyle.danger)
+    async def timeout_1h(self, button: Button, interaction: discord.Interaction):
+        await self.apply_timeout(datetime.timedelta(hours=1), interaction)
+
+    @discord.ui.button(label="6 часов", style=discord.ButtonStyle.danger)
+    async def timeout_6h(self, button: Button, interaction: discord.Interaction):
+        await self.apply_timeout(datetime.timedelta(hours=6), interaction)
+
+    @discord.ui.button(label="1 день", style=discord.ButtonStyle.danger)
+    async def timeout_1d(self, button: Button, interaction: discord.Interaction):
+        await self.apply_timeout(datetime.timedelta(days=1), interaction)
+
+    @discord.ui.button(label="Отмена", style=discord.ButtonStyle.secondary)
+    async def cancel(self, button: Button, interaction: discord.Interaction):
+        await interaction.response.edit_message(content="❌ Операция отменена.", view=None)
+        self.stop()
+
+    async def apply_timeout(self, delta: datetime.timedelta, interaction: discord.Interaction):
+        try:
+            await self.member.timeout(delta, reason=f"Тайм-аут от {self.moderator}")
+            await interaction.response.edit_message(
+                content=f"✅ {self.member.mention} получил тайм-аут на {delta}.",
+                view=None
+            )
+            await Logger.log_event(
+                guild=interaction.guild,
+                event_type="command",
+                title="Тайм-аут",
+                description=f"{self.moderator.mention} выдал тайм-аут {self.member.mention} на {delta}",
+                color=0xe74c3c,
+                user=self.moderator,
+                target=self.member
+            )
+        except discord.Forbidden:
+            await interaction.response.edit_message(
+                content="❌ У меня недостаточно прав для тайм-аута.",
+                view=None
+            )
+        self.stop()
+
+@bot.command(name="timeout", aliases=["таймаут"])
+@commands.has_permissions(moderate_members=True)
+async def timeout(ctx, member: discord.Member):
+    if member.top_role >= ctx.author.top_role and ctx.author != ctx.guild.owner:
+        await ctx.send("❌ Вы не можете затаймаутить этого пользователя.")
+        return
+    if not ctx.guild.me.guild_permissions.moderate_members:
+        await ctx.send("❌ У меня нет прав на выдачу тайм-аута.")
+        return
+
+    view = TimeoutView(member, ctx.author)
+    await ctx.send(
+        f"🕒 Выберите длительность тайм-аута для {member.mention}:",
+        view=view
+    )
+
+@bot.command(name="clear", aliases=["очистить"])
+@commands.has_permissions(manage_messages=True)
+async def clear(ctx, amount: int):
+    if amount <= 0:
+        await ctx.send("❌ Укажите положительное число.")
+        return
+    amount = min(amount, 100)
+    deleted = await ctx.channel.purge(limit=amount + 1)
+    count = len(deleted) - 1
+    await ctx.send(f"✅ Удалено {count} сообщений.", delete_after=5)
+    await Logger.log_event(
+        guild=ctx.guild,
+        event_type="command",
+        title="Очистка сообщений",
+        description=f"{ctx.author.mention} удалил {count} сообщений в {ctx.channel.mention}",
+        color=0x3498db,
+        user=ctx.author,
+        channel=ctx.channel
+    )
+
+@clear.error
+async def clear_error(ctx, error):
+    if isinstance(error, commands.BadArgument):
+        await ctx.send("❌ Укажите число сообщений для удаления (например: `!clear 10`).")
+
+# ---- ПРЕДУПРЕЖДЕНИЯ ----
+@bot.command(name="warn", aliases=["пред"])
+@commands.has_permissions(kick_members=True)
+async def warn(ctx, member: discord.Member, *, reason="Не указана"):
+    if member.top_role >= ctx.author.top_role and ctx.author != ctx.guild.owner:
+        await ctx.send("❌ Вы не можете предупредить этого пользователя.")
+        return
+    await db.add_warn(ctx.guild.id, member.id, ctx.author.id, reason)
+    warns = await db.get_warns(ctx.guild.id, member.id)
+    warn_count = len(warns)
+
+    embed = discord.Embed(
+        title="⚠️ Предупреждение",
+        color=discord.Color.orange(),
+        timestamp=get_moscow_time()
+    )
+    embed.add_field(name="Пользователь", value=member.mention, inline=True)
+    embed.add_field(name="Модератор", value=ctx.author.mention, inline=True)
+    embed.add_field(name="Причина", value=reason, inline=False)
+    embed.add_field(name="Всего предупреждений", value=warn_count, inline=True)
+    embed.set_footer(text=f"ID: {member.id}")
+    await ctx.send(embed=embed)
+
+    if warn_count >= 3:
+        muted_role = discord.utils.get(ctx.guild.roles, name="Muted")
+        if not muted_role:
+            muted_role = await ctx.guild.create_role(name="Muted")
+            for channel in ctx.guild.channels:
+                await channel.set_permissions(muted_role, speak=False, send_messages=False)
+        try:
+            await member.add_roles(muted_role, reason="3+ предупреждения")
+            await ctx.send(f"🔇 Пользователь {member.mention} получил мут (3+ предупреждения).")
+        except:
+            pass
+
+    # Достижение за первое предупреждение
+    if warn_count == 1:
+        await db.check_achievement(member.id, "first_warning", ctx.guild)
+
+@bot.command(name="warns", aliases=["преды"])
+@commands.has_permissions(kick_members=True)
+async def warns(ctx, member: discord.Member):
+    warns = await db.get_warns(ctx.guild.id, member.id)
+    if not warns:
+        await ctx.send(f"✅ У {member.mention} нет предупреждений.")
+        return
+
+    embed = discord.Embed(
+        title=f"⚠️ Предупреждения {member.display_name}",
+        color=discord.Color.orange(),
+        timestamp=get_moscow_time()
+    )
+    embed.set_thumbnail(url=member.display_avatar.url)
+    for i, w in enumerate(warns[:10], 1):
+        mod = ctx.guild.get_member(w['moderator_id'])
+        mod_name = mod.display_name if mod else f"ID: {w['moderator_id']}"
+        timestamp = w['timestamp'].strftime('%d.%m.%Y %H:%M')
+        embed.add_field(
+            name=f"#{i} (ID: {w['id']})",
+            value=f"**Причина:** {w['reason']}\n**Модератор:** {mod_name}\n**Дата:** {timestamp}",
+            inline=False
+        )
+    embed.set_footer(text=f"Всего: {len(warns)}")
+    await ctx.send(embed=embed)
+
+@bot.command(name="clearwarns", aliases=["снятьпреды"])
+@commands.has_permissions(kick_members=True)
+async def clear_warns(ctx, member: discord.Member):
+    await db.clear_warns(ctx.guild.id, member.id)
+    await ctx.send(f"✅ Все предупреждения сняты с {member.mention}")
+
+@bot.command(name="delwarn", aliases=["удалитьпред"])
+@commands.has_permissions(kick_members=True)
+async def del_warn(ctx, warn_id: int):
+    await db.remove_warn(warn_id)
+    await ctx.send(f"✅ Предупреждение #{warn_id} удалено.")
+
+# ---- TELEGRAM ----
 @bot.command(name="telegram")
 @commands.has_permissions(administrator=True)
 async def telegram_cmd(ctx, action: str = None):
@@ -1617,78 +2425,6 @@ async def clear_commands(ctx):
     except Exception as e:
         await ctx.send(f"❌ Ошибка: {e}")
 
-@bot.command(name="warn", aliases=["пред"])
-@commands.has_permissions(kick_members=True)
-async def warn(ctx, member: discord.Member, *, reason="Не указана"):
-    if member.top_role >= ctx.author.top_role and ctx.author != ctx.guild.owner:
-        await ctx.send("❌ Вы не можете предупредить этого пользователя.")
-        return
-    await db.add_warn(ctx.guild.id, member.id, ctx.author.id, reason)
-    warns = await db.get_warns(ctx.guild.id, member.id)
-    warn_count = len(warns)
-
-    embed = discord.Embed(
-        title="⚠️ Предупреждение",
-        color=discord.Color.orange(),
-        timestamp=get_moscow_time()
-    )
-    embed.add_field(name="Пользователь", value=member.mention, inline=True)
-    embed.add_field(name="Модератор", value=ctx.author.mention, inline=True)
-    embed.add_field(name="Причина", value=reason, inline=False)
-    embed.add_field(name="Всего предупреждений", value=warn_count, inline=True)
-    embed.set_footer(text=f"ID: {member.id}")
-    await ctx.send(embed=embed)
-
-    if warn_count >= 3:
-        muted_role = discord.utils.get(ctx.guild.roles, name="Muted")
-        if not muted_role:
-            muted_role = await ctx.guild.create_role(name="Muted")
-            for channel in ctx.guild.channels:
-                await channel.set_permissions(muted_role, speak=False, send_messages=False)
-        try:
-            await member.add_roles(muted_role, reason="3+ предупреждения")
-            await ctx.send(f"🔇 Пользователь {member.mention} получил мут (3+ предупреждения).")
-        except:
-            pass
-
-@bot.command(name="warns", aliases=["преды"])
-@commands.has_permissions(kick_members=True)
-async def warns(ctx, member: discord.Member):
-    warns = await db.get_warns(ctx.guild.id, member.id)
-    if not warns:
-        await ctx.send(f"✅ У {member.mention} нет предупреждений.")
-        return
-
-    embed = discord.Embed(
-        title=f"⚠️ Предупреждения {member.display_name}",
-        color=discord.Color.orange(),
-        timestamp=get_moscow_time()
-    )
-    embed.set_thumbnail(url=member.display_avatar.url)
-    for i, w in enumerate(warns[:10], 1):
-        mod = ctx.guild.get_member(w['moderator_id'])
-        mod_name = mod.display_name if mod else f"ID: {w['moderator_id']}"
-        timestamp = w['timestamp'].strftime('%d.%m.%Y %H:%M')
-        embed.add_field(
-            name=f"#{i} (ID: {w['id']})",
-            value=f"**Причина:** {w['reason']}\n**Модератор:** {mod_name}\n**Дата:** {timestamp}",
-            inline=False
-        )
-    embed.set_footer(text=f"Всего: {len(warns)}")
-    await ctx.send(embed=embed)
-
-@bot.command(name="clearwarns", aliases=["снятьпреды"])
-@commands.has_permissions(kick_members=True)
-async def clear_warns(ctx, member: discord.Member):
-    await db.clear_warns(ctx.guild.id, member.id)
-    await ctx.send(f"✅ Все предупреждения сняты с {member.mention}")
-
-@bot.command(name="delwarn", aliases=["удалитьпред"])
-@commands.has_permissions(kick_members=True)
-async def del_warn(ctx, warn_id: int):
-    await db.remove_warn(warn_id)
-    await ctx.send(f"✅ Предупреждение #{warn_id} удалено.")
-
 @bot.command(name="помощь")
 async def help_command(ctx):
     embed = discord.Embed(
@@ -1701,19 +2437,25 @@ async def help_command(ctx):
         name="👤 **Для всех**",
         value="`!статистика` - ваша статистика\n`!статистика @пользователь` - статистика пользователя\n"
               "`!топ` - топ пользователей\n`!уровень` - ваш уровень и опыт\n"
-              "`!график` - график активности за 30 дней\n`!помощь` - это сообщение",
+              "`!график` - график активности за 30 дней\n"
+              "`!баланс` - ваши монеты\n`!топ_монет` - топ богачей\n"
+              "`!магазин` - магазин ролей\n`!купить <роль>` - купить роль\n"
+              "`!достижения` - ваши достижения\n`!все_достижения` - список всех достижений\n"
+              "`!помощь` - это сообщение",
         inline=False
     )
     embed.add_field(
         name="👑 **Для администраторов**",
         value="`!логи` - статус лог-канала\n`!логи #канал` - установить канал для логов\n"
               "`!тест_лога` - тест системы логирования\n"
-              "`!настройки_логов` - показать настройки\n"
-              "`!настройки_логов [тип] [on/off]` - изменить настройки\n"
+              "`!настройки_логов` - показать/изменить настройки\n"
+              "`!бэкап_канал` - канал для бэкапов БД\n`!ручной_бэкап` - создать бэкап вручную\n"
               "`!telegram` - управление Telegram уведомлениями\n"
               "`!warn` - выдать предупреждение\n`!warns` - список предупреждений\n"
               "`!clearwarns` - снять все предупреждения\n`!delwarn` - удалить предупреждение\n"
               "`!timeout` - тайм-аут через кнопки\n`!clear` - очистка сообщений\n"
+              "`!добавить_роль` - добавить роль в магазин\n`!удалить_роль` - удалить роль из магазина\n"
+              "`!сервер_статистика` - статистика сервера\n"
               "`!очистить_команды` - удалить старые слэш-команды",
         inline=False
     )
@@ -1753,14 +2495,18 @@ def run_flask():
 if __name__ == "__main__":
     print("=" * 60)
     print("🤖 Discord Voice Activity Bot")
-    print("📱 Версия: 11.0 (Ultimate Edition)")
+    print("📱 Версия: 12.0 (Ultimate Edition + Economy + Achievements + Server Stats + Auto Backup)")
     print("⏰ Часовой пояс: Московское время (GMT+3)")
     print("📈 Система уровней и ролей за уровень")
     print("📊 Графики активности")
+    print("💰 Экономика и магазин ролей")
+    print("🏆 Достижения и ачивки")
+    print("📦 Автобэкап БД в Telegram")
+    print("📊 Статистика сервера")
     print("🕒 Тайм-ауты через кнопки")
     print("🧹 Очистка сообщений")
     print("📝 Логирование: все события (сохраняется в БД)")
-    print(f"📱 Telegram: {'✅ ПОДКЛЮЧЕН (команды: /stats, /top, /roles, /help)' if telegram.enabled else '❌ НЕ НАСТРОЕН'}")
+    print(f"📱 Telegram: {'✅ ПОДКЛЮЧЕН (команды: /stats, /top, /roles, /eco_top, /help)' if telegram.enabled else '❌ НЕ НАСТРОЕН'}")
     print("=" * 60)
 
     flask_thread = threading.Thread(target=run_flask, daemon=True)
