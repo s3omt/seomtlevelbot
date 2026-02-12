@@ -2031,10 +2031,16 @@ async def top_coins(ctx):
     embed.add_field(name="Топ 5 богачей", value=text or "Нет данных", inline=False)
     embed.set_footer(text="Монеты зарабатываются за активность")
     await ctx.send(embed=embed)
-
+    
 @bot.command(name="магазин", aliases=["shop"])
-@commands.has_permissions(administrator=True)
 async def shop(ctx):
+    """Показать список ролей в магазине (доступно всем)"""
+    # Проверяем, включена ли экономика на сервере (опционально)
+    config = await get_guild_config(ctx.guild.id)
+    if not config.get("economy_enabled", True):
+        await ctx.send("❌ Экономика на этом сервере отключена администратором.")
+        return
+
     roles = await db.get_shop_roles(ctx.guild.id)
     if not roles:
         await ctx.send("🛒 Магазин пуст. Администратор может добавить роли через `!добавить_роль`.")
