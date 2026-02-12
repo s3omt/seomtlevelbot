@@ -29,33 +29,33 @@ class Database:
     def __init__(self):
         self.pool = None
 
-        async def connect(self):
-            """Создаёт пул соединений с PostgreSQL с повторными попытками"""
-            if self.pool is None:
-                db_url = os.environ.get("DATABASE_URL")
-                if not db_url:
-                    print("❌ ОШИБКА: DATABASE_URL не задан в переменных окружения!")
-                    return None
-    
-                for attempt in range(5):
-                    try:
-                        # ВАЖНО: ssl='require' обязательно для Railway!
-                        self.pool = await asyncpg.create_pool(
-                            db_url,
-                            min_size=1,
-                            max_size=10,
-                            command_timeout=60,
-                            ssl='require'
-                        )
-                        print(f"✅ Подключение к БД установлено (попытка {attempt+1})")
-                        break
-                    except Exception as e:
-                        print(f"⚠️ Попытка {attempt+1}/5 подключения к БД не удалась: {e}")
-                        if attempt == 4:
-                            print("❌ Не удалось подключиться к БД после 5 попыток")
-                            return None
-                        await asyncio.sleep(2 ** attempt)
-            return self.pool
+    async def connect(self):
+        """Создаёт пул соединений с PostgreSQL с повторными попытками"""
+        if self.pool is None:
+            db_url = os.environ.get("DATABASE_URL")
+            if not db_url:
+                print("❌ ОШИБКА: DATABASE_URL не задан в переменных окружения!")
+                return None
+
+            for attempt in range(5):
+                try:
+                    # ВАЖНО: ssl='require' обязательно для Railway!
+                    self.pool = await asyncpg.create_pool(
+                        db_url,
+                        min_size=1,
+                        max_size=10,
+                        command_timeout=60,
+                        ssl='require'
+                    )
+                    print(f"✅ Подключение к БД установлено (попытка {attempt+1})")
+                    break
+                except Exception as e:
+                    print(f"⚠️ Попытка {attempt+1}/5 подключения к БД не удалась: {e}")
+                    if attempt == 4:
+                        print("❌ Не удалось подключиться к БД после 5 попыток")
+                        return None
+                    await asyncio.sleep(2 ** attempt)
+        return self.pool
 
     async def init_db(self):
         """Инициализация таблиц и добавление недостающих колонок"""
