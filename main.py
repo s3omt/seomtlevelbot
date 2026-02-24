@@ -728,7 +728,7 @@ async def backup_db():
     if not db_url: return
     
     filename = f"backup_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.sql"
-    res = subprocess.run(["pg_dump", db_url, "-f", filename], capture_output=True, text=True)
+    res = subprocess.run(["pg_dump", db_url, "-T", "user_history", "-f", filename], capture_output=True, text=True)
     if res.returncode == 0:
         await telegram.send_document(filename, f"📦 Бэкап БД\n⏰ {format_moscow_time()}")
         os.remove(filename)
@@ -928,7 +928,7 @@ async def manual_backup(ctx):
     
     # Формируем файл и делаем дамп
     filename = f"manual_backup_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.sql"
-    res = subprocess.run(["pg_dump", db_url, "-f", filename], capture_output=True, text=True)
+    res = subprocess.run(["pg_dump", db_url, "-T", "user_history", "-f", filename], capture_output=True, text=True)
     
     if res.returncode == 0:
         # Отправляем в Telegram
