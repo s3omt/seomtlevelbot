@@ -56,7 +56,8 @@ class Database:
 
         async with pool.acquire() as conn:
             await conn.execute("""
-                CREATE TABLE IF NOT EXISTS users (user_id BIGINT PRIMARY KEY, messages INT DEFAULT 0, voice_minutes INT DEFAULT 0);
+                CREATE TABLE IF NOT EXISTS users (user_id BIGINT PRIMARY KEY, messages INT DEFAULT 0, voice_minutes INT DEFAULT 0, reputation INT DEFAULT 0);
+                CREATE TABLE IF NOT EXISTS rep_cooldowns (user_id BIGINT PRIMARY KEY, last_rep TIMESTAMP);
                 CREATE TABLE IF NOT EXISTS guild_config (
                     guild_id BIGINT PRIMARY KEY, log_channel BIGINT, backup_channel BIGINT,
                     voice_events BOOLEAN DEFAULT TRUE, role_events BOOLEAN DEFAULT TRUE,
@@ -83,7 +84,48 @@ class Database:
             for col in ["backup_channel BIGINT", "economy_enabled BOOLEAN DEFAULT TRUE", "achievements_enabled BOOLEAN DEFAULT TRUE"]:
                 try: await conn.execute(f"ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS {col}")
                 except Exception: pass
+            try: await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS reputation INT DEFAULT 0")
+            except Exception: pass
+            
             print("✅ База данных инициализирована")
+
+    # --- МЕТОДЫ РЕПУТАЦИИ ---
+    async def can_give_rep(self, user_id: int):
+        pool = await self.connect()
+        if not pool: return False, 0
+        async with pool.acquire() as conn:
+            # Считаем разницу времени прямо в базе данных, чтобы избежать багов с часовыми поясами
+            row = await conn.fetchrow("SELECT EXTRACT(EPOCH FROM (NOW() AT TIME ZONE 'UTC' - last_rep)) AS diff FROM rep_cooldowns WHERE user_id = $1", user_id)
+            if not row: return True, 0
+            
+            diff = row['diff']
+            if diff >= 86400: # 24 часа = 86400 секунд
+                return True, 0
+            else:
+                return False, int(86400 - diff)
+
+    async def add_reputation(self, sender_id: int, target_id: int):
+        pool = await self.connect()
+        if pool:
+            async with pool.acquire() as conn:
+                await conn.execute("""
+                    INSERT INTO rep_cooldowns (user_id, last_rep) VALUES ($1, NOW() AT TIME ZONE 'UTC')
+                    ON CONFLICT (user_id) DO UPDATE SET last_rep = NOW() AT TIME ZONE 'UTC'
+                """, sender_id)
+                
+                await conn.execute("""
+                    INSERT INTO users (user_id, reputation) VALUES ($1, 1)
+                    ON CONFLICT (user_id) DO UPDATE SET reputation = COALESCE(users.reputation, 0) + 1
+                """, target_id)
+                
+                return await conn.fetchval("SELECT reputation FROM users WHERE user_id = $1", target_id)
+        return 0
+
+    async def get_reputation(self, user_id: int):
+        pool = await self.connect()
+        if not pool: return 0
+        async with pool.acquire() as conn:
+            return await conn.fetchval("SELECT reputation FROM users WHERE user_id = $1", user_id) or 0
 
     # --- МЕТОДЫ ПОЛЬЗОВАТЕЛЕЙ И СТАТИСТИКИ ---
     async def add_message(self, user_id: int):
@@ -392,9 +434,10 @@ def format_moscow_time(dt=None, format_str="%d.%m.%Y %H:%M:%S"):
 LEVEL_ROLES = {
     5: "Ньюфажина", 10: "Нормис", 20: "Бывалый", 30: "Альтуха",
     40: "Опиум", 50: "Игрок", 60: "Тектоник", 70: "Вайперр",
-    85: "Модератор", 100: "Админ"
+    85: "Модератор по сиськам", 100: "Админ по ляжкам"
 }
 DEFAULT_ROLE_NAME = "Залётный"
+REP_REWARD_ROLE = "Ну крутой ля" # Роль за 10 репутации
 
 intents = discord.Intents.default()
 intents.members = True
@@ -403,7 +446,6 @@ intents.voice_states = True
 intents.messages = True
 intents.guilds = True
 
-bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 voice_sessions = {}
 guild_config_cache = {}
 
@@ -491,15 +533,54 @@ class TelegramBot:
         
         if text == "/stats": await self.send_stats()
         elif text == "/help": await self.send_message("📚 Команды: /stats, /top, /roles, /eco_top, /help")
-        # (Остальные команды как в оригинале, для экономии места здесь сокращены)
 
-    async def stop_polling(self):
+    async def close(self):
         if self.polling_task:
             self.polling_task.cancel()
             self.polling_task = None
         if self.session: await self.session.close()
 
 telegram = TelegramBot(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID)
+
+
+# ==================== КЛАСС БОТА (ДЛЯ МЯГКОГО ВЫКЛЮЧЕНИЯ) ====================
+class ActivityBot(commands.Bot):
+    async def close(self):
+        print("\n🛑 Получен сигнал на выключение. Сохраняем данные...")
+        now = datetime.datetime.now(datetime.timezone.utc)
+        saved_count = 0
+        
+        # 1. Сохраняем недосчитанные минуты в голосовых каналах
+        for user_id_str, session_start in list(voice_sessions.items()):
+            duration = (now - session_start).total_seconds() / 60
+            if duration >= 1:
+                member_id = int(user_id_str)
+                await db.add_voice_time(member_id, int(duration))
+                
+                coin_gain = int(duration) // 5
+                if coin_gain > 0:
+                    await db.add_coins(member_id, coin_gain)
+                
+                await db.add_xp(member_id, int(duration) * 2)
+                saved_count += 1
+                
+        print(f"✅ Сохранено голосовых сессий: {saved_count}")
+
+        # 2. Корректно закрываем соединения БД
+        if db.pool:
+            await db.pool.close()
+            print("🔌 Соединение с БД корректно закрыто.")
+            
+        # 3. Закрываем сессию Telegram
+        if telegram.enabled:
+            await telegram.close()
+            print("📱 Соединение с Telegram закрыто.")
+            
+        print("👋 Бот успешно завершил работу.")
+        await super().close()
+
+# Создаем бота с использованием нашего нового класса
+bot = ActivityBot(command_prefix="!", intents=intents, help_command=None)
 
 # ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
 async def get_guild_config(guild_id: int):
@@ -518,7 +599,6 @@ class Logger:
             log_channel_obj = guild.get_channel(log_ch_id)
             if not log_channel_obj: return
             
-            # Проверка включен ли лог этого типа
             config_keys = {"voice": "voice_events", "role": "role_events", "member": "member_events", "channel": "channel_events", "server": "server_events", "message": "message_events", "command": "command_events", "achievement": "role_events", "economy": "command_events"}
             if event_type in config_keys and not config.get(config_keys[event_type], True): return
             
@@ -790,12 +870,51 @@ async def stats(ctx, member: discord.Member = None):
     member = member or ctx.author
     data = await db.get_user_stats(member.id)
     level_info = await db.get_level_info(member.id)
+    rep = await db.get_reputation(member.id)
     
     embed = discord.Embed(title=f"📊 Статистика {member.display_name}", color=discord.Color.blue())
     embed.add_field(name="🎤 Голос", value=f"{data['voice_hours']}ч {data['voice_remaining_minutes']}м", inline=True)
     embed.add_field(name="💬 Сообщений", value=f"{data['messages']}", inline=True)
     embed.add_field(name="📈 Уровень", value=f"{level_info['level']} ({level_info['xp']} XP)", inline=True)
+    embed.add_field(name="⭐ Репутация", value=f"{rep}", inline=True)
     await ctx.send(embed=embed)
+
+@bot.command(name="rep", aliases=["реп", "репутация", "+rep"])
+async def give_reputation(ctx, member: discord.Member):
+    if member.bot:
+        return await ctx.send("❌ Ботам репутация не нужна!")
+    if member.id == ctx.author.id:
+        return await ctx.send("❌ Нельзя выдать репутацию самому себе!")
+
+    # Проверка кулдауна (раз в 24 часа)
+    can_give, cooldown_sec = await db.can_give_rep(ctx.author.id)
+    if not can_give:
+        hours = cooldown_sec // 3600
+        mins = (cooldown_sec % 3600) // 60
+        return await ctx.send(f"⏳ Вы уже выдавали репутацию сегодня. Подождите еще **{hours}ч {mins}м**.")
+
+    # Выдача репутации
+    new_rep = await db.add_reputation(ctx.author.id, member.id)
+
+    embed = discord.Embed(
+        title="⭐ Плюс к репутации!",
+        description=f"{ctx.author.mention} выразил уважение {member.mention}!\nТеперь у него/неё **{new_rep}** ед. репутации.",
+        color=discord.Color.gold()
+    )
+    await ctx.send(embed=embed)
+
+    # Проверка достижения 10 репутации для выдачи роли
+    if new_rep >= 10:
+        role = discord.utils.get(ctx.guild.roles, name=REP_REWARD_ROLE)
+        if not role:
+            role = await RoleManager.ensure_role_exists(ctx.guild, REP_REWARD_ROLE)
+            
+        if role and role not in member.roles:
+            try:
+                await member.add_roles(role, reason="Достиг 10 единиц репутации")
+                await ctx.send(f"🎉 {member.mention} получил особую роль **{REP_REWARD_ROLE}** за отличную репутацию!")
+            except discord.Forbidden:
+                pass
 
 @bot.command(name="график", aliases=["graph"])
 async def activity_graph(ctx, member: discord.Member = None):
@@ -889,6 +1008,7 @@ async def help_command(ctx):
         "`!профиль` (или `!rank`) — Ваша красивая карточка профиля со статистикой\n"
         "`!статистика [@юзер]` — Подробная текстовая статистика активности\n"
         "`!график [@юзер]` — График вашей активности за последние 30 дней\n"
+        "`!rep [@юзер]` (или `+rep`) — Выдать репутацию (раз в 24 часа)\n"
         "`!магазин` — Посмотреть список ролей, доступных для покупки\n"
         "`!купить <название>` — Купить роль за накопленные монеты"
     )
@@ -948,15 +1068,10 @@ async def manual_backup(ctx):
 @bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send(f"❌ Пропущен аргумент: `{error.param.name}`.")
+        await ctx.send(f"❌ Пропущен аргумент: `{error.param.name}`. Введите `!помощь` для справки.")
     elif isinstance(error, commands.MissingPermissions):
-        await ctx.send(f"❌ Нет прав.")
+        await ctx.send(f"❌ Нет прав для использования этой команды.")
 
 # ==================== ЗАПУСК ====================
 if __name__ == "__main__":
-    try:
-        bot.run(TOKEN)
-    except KeyboardInterrupt:
-        print("🛑 Бот остановлен")
-    finally:
-        asyncio.run(telegram.close())
+    bot.run(TOKEN)
