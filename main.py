@@ -874,6 +874,77 @@ async def buy_role(ctx, *, role_name: str):
     await ctx.author.add_roles(role, reason="Покупка")
     await ctx.send(f"✅ Вы купили роль **{role.name}**!")
 
+# ---- СВОДКА И БЭКАП ----
+@bot.command(name="помощь", aliases=["help", "команды"])
+async def help_command(ctx):
+    embed = discord.Embed(
+        title="📚 Список команд бота",
+        description="Здесь собраны все доступные команды сервера.",
+        color=discord.Color.blurple(),
+        timestamp=get_moscow_time()
+    )
+    
+    # Команды для всех пользователей
+    user_cmds = (
+        "`!профиль` (или `!rank`) — Ваша красивая карточка профиля со статистикой\n"
+        "`!статистика [@юзер]` — Подробная текстовая статистика активности\n"
+        "`!график [@юзер]` — График вашей активности за последние 30 дней\n"
+        "`!магазин` — Посмотреть список ролей, доступных для покупки\n"
+        "`!купить <название>` — Купить роль за накопленные монеты"
+    )
+    embed.add_field(name="👤 Основные команды", value=user_cmds, inline=False)
+    
+    # Команды администратора (показываем только тем, у кого есть права)
+    if ctx.author.guild_permissions.administrator:
+        admin_cmds = (
+            "`!ручной_бэкап` (или `!бэкап`) — Принудительно сделать бэкап базы данных и отправить в Telegram"
+        )
+        embed.add_field(name="👑 Команды администратора", value=admin_cmds, inline=False)
+        
+    embed.set_footer(text=f"Бот: {bot.user.name} • Время МСК", icon_url=bot.user.display_avatar.url if bot.user.display_avatar else None)
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="ручной_бэкап", aliases=["бэкап", "backup"])
+@commands.has_permissions(administrator=True)
+async def manual_backup(ctx):
+    # Проверяем, настроен ли Telegram
+    if not telegram.enabled:
+        await ctx.send("❌ Telegram-бот не настроен. Для получения бэкапов укажите токены в переменных окружения.")
+        return
+        
+    await ctx.send("⏳ Создаю резервную копию базы данных...")
+    
+    # Проверяем наличие утилиты pg_dump
+    pg_dump_path = subprocess.run(["which", "pg_dump"], capture_output=True, text=True).stdout.strip()
+    if not pg_dump_path:
+        await ctx.send("❌ Утилита `pg_dump` не найдена в системе. Убедитесь, что `postgresql` добавлен в Nixpacks на Railway.")
+        return 
+    
+    db_url = os.environ.get("DATABASE_URL")
+    if not db_url:
+        await ctx.send("❌ Не найдена переменная `DATABASE_URL`.")
+        return
+    
+    # Формируем файл и делаем дамп
+    filename = f"manual_backup_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.sql"
+    res = subprocess.run(["pg_dump", db_url, "-f", filename], capture_output=True, text=True)
+    
+    if res.returncode == 0:
+        # Отправляем в Telegram
+        success = await telegram.send_document(
+            filename, 
+            f"📦 **Ручной бэкап БД**\nЗапросил: {ctx.author.display_name}\nСервер: {ctx.guild.name}\n⏰ {format_moscow_time()}"
+        )
+        os.remove(filename) # Удаляем файл с сервера после отправки
+        
+        if success:
+            await ctx.send("✅ Бэкап успешно создан и отправлен в ваш Telegram!")
+        else:
+            await ctx.send("⚠️ Бэкап создан, но произошла ошибка при отправке в Telegram. Проверьте ID чата.")
+    else:
+        await ctx.send(f"❌ Ошибка при создании бэкапа:\n```text\n{res.stderr}\n```")
+
 @bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.MissingRequiredArgument):
