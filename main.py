@@ -448,7 +448,7 @@ LEVEL_ROLES = {
     85: "Модератор по сиськам", 100: "Админ по ляжкам"
 }
 DEFAULT_ROLE_NAME = "Залётный"
-REP_REWARD_ROLE = "Ну крутой ля" # Роль за 10 репутации
+REP_REWARD_ROLE = "Ну крутой ля" 
 
 intents = discord.Intents.default()
 intents.members = True
@@ -614,10 +614,166 @@ class TicketView(discord.ui.View):
         except discord.Forbidden:
             await interaction.response.send_message("❌ Ошибка прав: я не могу создавать каналы.", ephemeral=True)
 
+# ==================== ПАРСЕР ГАЙДОВ С ИИ ПЕРЕВОДОМ ====================
+def split_text_for_discord(text: str, max_len: int = 1900):
+    """Разбивает длинный текст на куски, не разрывая слова, чтобы пролезть в лимиты Discord"""
+    chunks = []
+    while len(text) > max_len:
+        split_at = text.rfind('\n', 0, max_len)
+        if split_at == -1:
+            split_at = text.rfind(' ', 0, max_len)
+            if split_at == -1:
+                split_at = max_len
+        chunks.append(text[:split_at])
+        text = text[split_at:].lstrip()
+    if text:
+        chunks.append(text)
+    return chunks
+
+async def fetch_and_translate_guide(url: str):
+    """Качает гайд с Game8, достает весь HTML контент, и переводит его через ИИ"""
+    if not ai_client:
+        return None, None
+        
+    try:
+        async with aiohttp.ClientSession() as session:
+            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+            async with session.get(url, headers=headers) as resp:
+                if resp.status != 200: return None, None
+                html = await resp.text()
+
+        soup = BeautifulSoup(html, 'lxml')
+        
+        # Заголовок
+        title_meta = soup.find('meta', property='og:title')
+        en_title = title_meta['content'].replace(" | Game8", "") if title_meta else "Гайд Endfield"
+        
+        # Основной контент статьи
+        content = soup.find('div', class_='archive-style-wrapper')
+        if not content:
+            content = soup.find('article') or soup.body
+
+        # ЗАМЕНЯЕМ ВСЕ КАРТИНКИ НА ПРЯМЫЕ ССЫЛКИ
+        # Discord сам превратит ссылки в полноценные огромные картинки внутри сообщения
+        for img in content.find_all('img'):
+            src = img.get('data-src') or img.get('src')
+            if src:
+                if src.startswith('//'): src = 'https:' + src
+                elif src.startswith('/'): src = 'https://game8.co' + src
+                img.replace_with(f"\n{src}\n")
+
+        # Удаляем мусор, чтобы не тратить лимиты ИИ
+        for tag in content(['script', 'style', 'ins', 'iframe', 'nav', 'div.toc']):
+            tag.decompose()
+
+        raw_text = str(content)
+
+        prompt = f"""
+        Ты — эксперт по игре Arknights: Endfield. Твоя задача — перевести подробный гайд с сайта Game8 на русский язык и оформить его для публикации в Discord.
+
+        ЗАГОЛОВОК СТАТЬИ: {en_title}
+
+        ПРАВИЛА ОФОРМЛЕНИЯ:
+        1. Переведи ВЕСЬ полезный текст статьи. Не сокращай и не делай кратких выжимок!
+        2. Используй Markdown Discord (жирный шрифт **, заголовки #, списки).
+        3. В тексте есть ссылки на изображения (вида https://...). ОБЯЗАТЕЛЬНО оставляй эти ссылки в тексте отдельными строками, чтобы они отобразились в Discord!
+        4. Если в тексте есть HTML-таблицы, преобразуй их в аккуратный текстовый список или используй блочный код.
+        5. Проигнорируй мусор ("Table of Contents", "Share this", "Leave a comment").
+        6. Правильно переводи игровой сленг (АоЕ, Урон, Операторы, Кастер и т.д.).
+
+        ОТВЕТ ВЫДАЙ СТРОГО В ТАКОМ ФОРМАТЕ (используй === как разделитель):
+        [Переведенный Заголовок]
+        ===
+        [Полный переведенный текст гайда в формате Markdown]
+
+        ТЕКСТ ДЛЯ ПЕРЕВОДА:
+        {raw_text[:40000]}
+        """
+        
+        response = await asyncio.to_thread(
+            ai_client.models.generate_content,
+            model='gemini-2.5-flash',
+            contents=prompt
+        )
+        
+        parts = response.text.split('===')
+        if len(parts) == 2:
+            return parts[0].strip(), parts[1].strip()
+        return en_title, response.text.strip()
+        
+    except Exception as e:
+        print(f"Ошибка парсинга/перевода: {e}")
+        return None, None
+
+@tasks.loop(minutes=30)
+async def auto_game8_parser():
+    """Фоновая задача: ищет новые гайды и постит их в ветках"""
+    url = "https://game8.co/games/Arknights-Endfield"
+    try:
+        async with aiohttp.ClientSession() as session:
+            headers = {'User-Agent': 'Mozilla/5.0'}
+            async with session.get(url, headers=headers) as resp:
+                if resp.status != 200: return
+                html = await resp.text()
+
+        soup = BeautifulSoup(html, 'lxml')
+        links = soup.select('a.a-link') 
+        
+        new_guides = []
+        for link in links:
+            href = link.get('href')
+            if href and "/games/Arknights-Endfield/archives/" in href:
+                full_url = "https://game8.co" + href if href.startswith('/') else href
+                if not await db.is_guide_posted(full_url):
+                    new_guides.append(full_url)
+                    
+        # Обрабатываем только 1 новый гайд за раз, чтобы не спамить
+        if new_guides:
+            target_url = new_guides[0]
+            
+            ru_title, ru_body = await fetch_and_translate_guide(target_url)
+            if not ru_title or not ru_body: return
+
+            channels = await db.get_all_guide_channels()
+            for guild_id, channel_id in channels:
+                guild = bot.get_guild(guild_id)
+                if guild:
+                    ch = guild.get_channel(channel_id)
+                    if ch:
+                        try:
+                            # 1. Отправляем карточку-уведомление в сам канал
+                            embed = discord.Embed(
+                                title=f"📚 Новый гайд: {ru_title}",
+                                url=target_url,
+                                description="⬇️ Полный переведенный гайд читайте в ветке ниже! ⬇️",
+                                color=0x00A8FF
+                            )
+                            embed.set_footer(text="Game8 • Переведено ИИ", icon_url="https://game8.co/favicon.ico")
+                            msg = await ch.send(embed=embed)
+                            
+                            # 2. Создаем Ветку (Thread) от этого сообщения
+                            thread = await msg.create_thread(name=ru_title[:100], auto_archive_duration=1440)
+                            
+                            # 3. Закидываем куски гайда внутрь ветки
+                            chunks = split_text_for_discord(ru_body)
+                            for chunk in chunks:
+                                await thread.send(chunk)
+                                await asyncio.sleep(1) # Небольшая пауза, чтобы не словить лимит Discord
+                        except Exception as e:
+                            print(f"Ошибка отправки ветки в Discord: {e}")
+            
+            await db.mark_guide_posted(target_url)
+
+    except Exception as e:
+        print(f"Ошибка фонового парсера Game8: {e}")
+
+@auto_game8_parser.before_loop
+async def before_parser():
+    await bot.wait_until_ready()
+
 # ==================== КЛАСС БОТА ====================
 class ActivityBot(commands.Bot):
     async def setup_hook(self):
-        # Регистрируем кнопки, чтобы они работали после перезапуска
         self.add_view(TicketView())
         self.add_view(TicketControlsView())
 
@@ -829,117 +985,7 @@ def _generate_profile_card_sync(display_name, tag, member_id, level_info, balanc
     buf.seek(0)
     return buf
 
-# ==================== ПАРСЕР GAME8 С ИИ ПЕРЕВОДОМ ====================
-async def translate_with_gemini(title: str, text: str) -> tuple:
-    if not ai_client:
-        return title, text # Если нет ключа, возвращаем английский текст
-    
-    prompt = f"""
-    Ты - профессиональный переводчик и эксперт по игре Arknights: Endfield.
-    Переведи заголовок и краткое описание статьи с сайта Game8 на русский язык. 
-    Используй правильный игровой сленг (Операторы, Урон, Навыки, АоЕ, Кастер и т.д.).
-    Сделай текст живым и интересным для геймеров.
-    
-    ЗАГОЛОВОК: {title}
-    ОПИСАНИЕ: {text}
-    
-    Ответь СТРОГО в таком формате:
-    [ЗАГОЛОВОК_РУС]
-    ===
-    [ОПИСАНИЕ_РУС]
-    """
-    try:
-        response = await asyncio.to_thread(
-            ai_client.models.generate_content,
-            model='gemini-2.5-flash',
-            contents=prompt
-        )
-        parts = response.text.split('===')
-        if len(parts) == 2:
-            return parts[0].strip(), parts[1].strip()
-        return title, response.text.strip()
-    except Exception as e:
-        print(f"Ошибка перевода Gemini: {e}")
-        return title, text
-
-@tasks.loop(minutes=30)
-async def auto_game8_parser():
-    """Фоновая задача: проверяет новые статьи на Game8 раз в 30 минут"""
-    url = "https://game8.co/games/Arknights-Endfield"
-    try:
-        async with aiohttp.ClientSession() as session:
-            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-            async with session.get(url, headers=headers) as resp:
-                if resp.status != 200: return
-                html = await resp.text()
-
-        soup = BeautifulSoup(html, 'lxml')
-        links = soup.select('a.a-link') 
-        
-        new_guides = []
-        for link in links:
-            href = link.get('href')
-            if href and "/games/Arknights-Endfield/archives/" in href:
-                full_url = "https://game8.co" + href if href.startswith('/') else href
-                if not await db.is_guide_posted(full_url):
-                    new_guides.append(full_url)
-                    
-        # Обрабатываем только 1 новый гайд за раз
-        if new_guides:
-            target_url = new_guides[0]
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.get(target_url, headers=headers) as resp:
-                    article_html = await resp.text()
-            
-            article_soup = BeautifulSoup(article_html, 'lxml')
-            
-            title_meta = article_soup.find('meta', property='og:title')
-            en_title = title_meta['content'].replace(" | Game8", "") if title_meta else "Гайд Endfield"
-            
-            desc_meta = article_soup.find('meta', property='og:description')
-            en_desc = desc_meta['content'] if desc_meta else "Новая информация по игре по ссылке ниже."
-            
-            img_meta = article_soup.find('meta', property='og:image')
-            img_url = img_meta['content'] if img_meta else None
-
-            # Переводим через Gemini
-            ru_title, ru_desc = await translate_with_gemini(en_title, en_desc)
-
-            embed = discord.Embed(
-                title=f"📋 {ru_title}",
-                url=target_url,
-                description=ru_desc,
-                color=0x00A8FF,
-                timestamp=get_moscow_time()
-            )
-            if img_url:
-                embed.set_image(url=img_url)
-            embed.set_footer(text="Game8 • Переведено ИИ", icon_url="https://game8.co/favicon.ico")
-
-            view = discord.ui.View()
-            view.add_item(discord.ui.Button(label="Читать оригинал", style=discord.ButtonStyle.link, url=target_url))
-
-            # Отправляем во все настроенные каналы серверов
-            channels = await db.get_all_guide_channels()
-            for guild_id, channel_id in channels:
-                guild = bot.get_guild(guild_id)
-                if guild:
-                    ch = guild.get_channel(channel_id)
-                    if ch:
-                        try: await ch.send(embed=embed, view=view)
-                        except: pass
-            
-            await db.mark_guide_posted(target_url)
-
-    except Exception as e:
-        print(f"Ошибка фонового парсера Game8: {e}")
-
-@auto_game8_parser.before_loop
-async def before_parser():
-    await bot.wait_until_ready()
-
-# ==================== ЗАДАЧИ ====================
+# ==================== ЗАДАЧИ АКТИВНОСТИ ====================
 @tasks.loop(minutes=5)
 async def check_voice_time():
     now = datetime.datetime.now(datetime.timezone.utc)
@@ -1041,6 +1087,42 @@ async def on_voice_state_update(member, before, after):
             del voice_sessions[uid]
 
 # ==================== КОМАНДЫ DISCORD ====================
+@bot.command(name="гайд", aliases=["guide", "game8"])
+async def manual_game8_guide(ctx, url: str):
+    """Ручная команда: Парсит полный гайд с Game8 и создает ветку с переводом"""
+    if "game8.co" not in url:
+        return await ctx.send("❌ Поддерживаются только ссылки с сайта Game8!")
+
+    loading_msg = await ctx.send("⏳ Читаю страницу, вытягиваю картинки и перевожу огромный текст. Это займет около 10-20 секунд...")
+
+    ru_title, ru_body = await fetch_and_translate_guide(url)
+    if not ru_title or not ru_body:
+        return await loading_msg.edit(content="❌ Не удалось получить или перевести гайд. Возможно, неправильная ссылка или ИИ не ответил.")
+
+    # 1. Основное сообщение-заголовок
+    embed = discord.Embed(
+        title=f"📚 Новый гайд: {ru_title}",
+        url=url,
+        description="⬇️ Полный переведенный гайд со всеми таблицами и картинками читайте в ветке ниже! ⬇️",
+        color=0x00A8FF
+    )
+    embed.set_footer(text="Game8 • Переведено ИИ", icon_url="https://game8.co/favicon.ico")
+    
+    view = discord.ui.View()
+    view.add_item(discord.ui.Button(label="Читать оригинал", style=discord.ButtonStyle.link, url=url))
+
+    await loading_msg.delete()
+    msg = await ctx.send(embed=embed, view=view)
+    
+    # 2. Создание ветки
+    thread = await msg.create_thread(name=ru_title[:100], auto_archive_duration=1440)
+    
+    # 3. Отправка кусков
+    chunks = split_text_for_discord(ru_body)
+    for chunk in chunks:
+        await thread.send(chunk)
+        await asyncio.sleep(1)
+
 @bot.command(name="канал_гайдов")
 @commands.has_permissions(administrator=True)
 async def set_guides_channel(ctx, channel: discord.TextChannel):
@@ -1197,7 +1279,8 @@ async def help_command(ctx):
         "`!график [@юзер]` — График вашей активности за последние 30 дней\n"
         "`!rep [@юзер]` (или `+rep`) — Выдать репутацию (раз в 24 часа)\n"
         "`!магазин` — Посмотреть список ролей, доступных для покупки\n"
-        "`!купить <название>` — Купить роль за накопленные монеты"
+        "`!купить <название>` — Купить роль за накопленные монеты\n"
+        "`!гайд <ссылка_на_game8>` — Полный перевод гайда с сайта Game8"
     )
     embed.add_field(name="👤 Основные команды", value=user_cmds, inline=False)
     
