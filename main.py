@@ -18,16 +18,14 @@ import subprocess
 from PIL import Image, ImageDraw, ImageFont
 import asyncpg
 from bs4 import BeautifulSoup
-import google.generativeai as genai
+from google import genai
 
 # ==================== НАСТРОЙКА ИИ ДЛЯ ПЕРЕВОДОВ ====================
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-    # Используем быструю и бесплатную модель
-    ai_model = genai.GenerativeModel('gemini-1.5-flash')
+    ai_client = genai.Client(api_key=GEMINI_API_KEY)
 else:
-    ai_model = None
+    ai_client = None
     print("⚠️ GEMINI_API_KEY не найден. Перевод гайдов работать не будет.")
 
 # ==================== РАБОТА С БАЗОЙ ДАННЫХ ====================
@@ -84,8 +82,6 @@ class Database:
                 CREATE TABLE IF NOT EXISTS server_history (id SERIAL PRIMARY KEY, guild_id BIGINT, date DATE DEFAULT CURRENT_DATE, total_messages INT DEFAULT 0, total_voice_minutes INT DEFAULT 0, active_users INT DEFAULT 0, new_members INT DEFAULT 0, UNIQUE(guild_id, date));
                 CREATE TABLE IF NOT EXISTS profile_themes (id SERIAL PRIMARY KEY, name TEXT UNIQUE, accent_color INT, bg_color INT, card_color INT, overlay_url TEXT, style TEXT DEFAULT 'default', price BIGINT DEFAULT 0, preview_url TEXT, purchasable BOOLEAN DEFAULT TRUE);
                 CREATE TABLE IF NOT EXISTS user_profile (user_id BIGINT PRIMARY KEY, theme_id INT DEFAULT 1, custom_accent_color INT, custom_bg_color INT, FOREIGN KEY (theme_id) REFERENCES profile_themes(id));
-                
-                /* Таблица для отслеживания опубликованных гайдов */
                 CREATE TABLE IF NOT EXISTS posted_guides (url TEXT PRIMARY KEY, posted_at TIMESTAMP DEFAULT NOW());
             """)
             
@@ -100,7 +96,7 @@ class Database:
     # --- МЕТОДЫ ДЛЯ ГАЙДОВ ---
     async def is_guide_posted(self, url: str):
         pool = await self.connect()
-        if not pool: return True # Заглушка при ошибке БД
+        if not pool: return True
         async with pool.acquire() as conn:
             return bool(await conn.fetchval("SELECT 1 FROM posted_guides WHERE url = $1", url))
 
@@ -452,7 +448,7 @@ LEVEL_ROLES = {
     85: "Модератор по сиськам", 100: "Админ по ляжкам"
 }
 DEFAULT_ROLE_NAME = "Залётный"
-REP_REWARD_ROLE = "Ну крутой ля" 
+REP_REWARD_ROLE = "Ну крутой ля" # Роль за 10 репутации
 
 intents = discord.Intents.default()
 intents.members = True
@@ -835,7 +831,7 @@ def _generate_profile_card_sync(display_name, tag, member_id, level_info, balanc
 
 # ==================== ПАРСЕР GAME8 С ИИ ПЕРЕВОДОМ ====================
 async def translate_with_gemini(title: str, text: str) -> tuple:
-    if not ai_model:
+    if not ai_client:
         return title, text # Если нет ключа, возвращаем английский текст
     
     prompt = f"""
@@ -853,7 +849,11 @@ async def translate_with_gemini(title: str, text: str) -> tuple:
     [ОПИСАНИЕ_РУС]
     """
     try:
-        response = await asyncio.to_thread(ai_model.generate_content, prompt)
+        response = await asyncio.to_thread(
+            ai_client.models.generate_content,
+            model='gemini-2.5-flash',
+            contents=prompt
+        )
         parts = response.text.split('===')
         if len(parts) == 2:
             return parts[0].strip(), parts[1].strip()
@@ -874,9 +874,6 @@ async def auto_game8_parser():
                 html = await resp.text()
 
         soup = BeautifulSoup(html, 'lxml')
-        
-        # Ищем блок с последними статьями (обычно это a.a-link или блоки с классом archive)
-        # Поскольку игра еще не вышла, парсим основные ссылки со страницы хаба
         links = soup.select('a.a-link') 
         
         new_guides = []
@@ -887,7 +884,7 @@ async def auto_game8_parser():
                 if not await db.is_guide_posted(full_url):
                     new_guides.append(full_url)
                     
-        # Обрабатываем только 1 новый гайд за раз, чтобы не спамить и не упереться в лимиты API
+        # Обрабатываем только 1 новый гайд за раз
         if new_guides:
             target_url = new_guides[0]
             
@@ -1214,7 +1211,6 @@ async def help_command(ctx):
         
     embed.set_footer(text=f"Бот: {bot.user.name} • Время МСК", icon_url=bot.user.display_avatar.url if bot.user.display_avatar else None)
     await ctx.send(embed=embed)
-
 
 @bot.command(name="ручной_бэкап", aliases=["бэкап", "backup"])
 @commands.has_permissions(administrator=True)
