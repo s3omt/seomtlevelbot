@@ -616,7 +616,6 @@ class TicketView(discord.ui.View):
 
 # ==================== ПАРСЕР ГАЙДОВ С ИИ ПЕРЕВОДОМ ====================
 def split_text_for_discord(text: str, max_len: int = 1900):
-    """Разбивает длинный текст на куски, не разрывая слова, чтобы пролезть в лимиты Discord"""
     chunks = []
     while len(text) > max_len:
         split_at = text.rfind('\n', 0, max_len)
@@ -631,7 +630,6 @@ def split_text_for_discord(text: str, max_len: int = 1900):
     return chunks
 
 async def fetch_and_translate_guide(url: str):
-    """Качает гайд с Game8, достает весь HTML контент, и переводит его через ИИ"""
     if not ai_client:
         return None, None
         
@@ -644,47 +642,59 @@ async def fetch_and_translate_guide(url: str):
 
         soup = BeautifulSoup(html, 'lxml')
         
-        # Заголовок
         title_meta = soup.find('meta', property='og:title')
         en_title = title_meta['content'].replace(" | Game8", "") if title_meta else "Гайд Endfield"
         
-        # Основной контент статьи
         content = soup.find('div', class_='archive-style-wrapper')
         if not content:
             content = soup.find('article') or soup.body
 
-        # ЗАМЕНЯЕМ ВСЕ КАРТИНКИ НА ПРЯМЫЕ ССЫЛКИ
-        # Discord сам превратит ссылки в полноценные огромные картинки внутри сообщения
-        for img in content.find_all('img'):
-            src = img.get('data-src') or img.get('src')
-            if src:
-                if src.startswith('//'): src = 'https:' + src
-                elif src.startswith('/'): src = 'https://game8.co' + src
-                img.replace_with(f"\n{src}\n")
+        # 1. УБИВАЕМ МУСОРНЫЕ ССЫЛКИ, СОХРАНЯЯ ТЕКСТ
+        # Это предотвратит спам ссылками на тирлисты внутри текста
+        for a_tag in content.find_all('a'):
+            a_tag.unwrap() # Снимает тег <a>, оставляя текст внутри него
 
-        # Удаляем мусор, чтобы не тратить лимиты ИИ
+        # 2. ФИЛЬТРУЕМ КАРТИНКИ
+        for img in content.find_all('img'):
+            src = img.get('data-src') or img.get('src', '')
+            class_name = img.get('class', [])
+            
+            # Удаляем иконки, счетчики, базовый UI
+            if not src or src.startswith('data:image') or 'icon' in src.lower() or 'a-icon' in class_name:
+                img.decompose()
+                continue
+                
+            if src.startswith('//'): src = 'https:' + src
+            elif src.startswith('/'): src = 'https://game8.co' + src
+            
+            # Вставляем картинку с отступами
+            img.replace_with(f"\n\n{src}\n\n")
+
+        # Удаляем мусорные блоки Game8
         for tag in content(['script', 'style', 'ins', 'iframe', 'nav', 'div.toc']):
+            tag.decompose()
+            
+        for tag in content.find_all('div', class_=['a-ad', 'a-ad__container', 'a-linkHeader', 'article-bottom-links']):
             tag.decompose()
 
         raw_text = str(content)
 
         prompt = f"""
-        Ты — эксперт по игре Arknights: Endfield. Твоя задача — перевести подробный гайд с сайта Game8 на русский язык и оформить его для публикации в Discord.
+        Ты — эксперт по игре Arknights: Endfield. Переведи гайд с сайта Game8 на русский язык.
 
         ЗАГОЛОВОК СТАТЬИ: {en_title}
 
         ПРАВИЛА ОФОРМЛЕНИЯ:
-        1. Переведи ВЕСЬ полезный текст статьи. Не сокращай и не делай кратких выжимок!
-        2. Используй Markdown Discord (жирный шрифт **, заголовки #, списки).
-        3. В тексте есть ссылки на изображения (вида https://...). ОБЯЗАТЕЛЬНО оставляй эти ссылки в тексте отдельными строками, чтобы они отобразились в Discord!
-        4. Если в тексте есть HTML-таблицы, преобразуй их в аккуратный текстовый список или используй блочный код.
-        5. Проигнорируй мусор ("Table of Contents", "Share this", "Leave a comment").
-        6. Правильно переводи игровой сленг (АоЕ, Урон, Операторы, Кастер и т.д.).
+        1. Переведи ВЕСЬ полезный текст. Не делай кратких выжимок!
+        2. Используй Markdown Discord.
+        3. В тексте есть прямые ссылки на картинки (начинаются с https://...). ОБЯЗАТЕЛЬНО оставляй эти ссылки ровно на тех же местах в тексте, где они находятся сейчас. КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО группировать ссылки на картинки в конце текста! Они должны стоять там же, где были в оригинале.
+        4. Если есть HTML-таблицы, преврати их в аккуратные списки.
+        5. Используй правильный игровой сленг.
 
-        ОТВЕТ ВЫДАЙ СТРОГО В ТАКОМ ФОРМАТЕ (используй === как разделитель):
+        ОТВЕТ ВЫДАЙ СТРОГО В ТАКОМ ФОРМАТЕ (с разделителем ===):
         [Переведенный Заголовок]
         ===
-        [Полный переведенный текст гайда в формате Markdown]
+        [Полный переведенный текст]
 
         ТЕКСТ ДЛЯ ПЕРЕВОДА:
         {raw_text[:40000]}
@@ -707,7 +717,6 @@ async def fetch_and_translate_guide(url: str):
 
 @tasks.loop(minutes=30)
 async def auto_game8_parser():
-    """Фоновая задача: ищет новые гайды и постит их в ветках"""
     url = "https://game8.co/games/Arknights-Endfield"
     try:
         async with aiohttp.ClientSession() as session:
@@ -727,10 +736,8 @@ async def auto_game8_parser():
                 if not await db.is_guide_posted(full_url):
                     new_guides.append(full_url)
                     
-        # Обрабатываем только 1 новый гайд за раз, чтобы не спамить
         if new_guides:
             target_url = new_guides[0]
-            
             ru_title, ru_body = await fetch_and_translate_guide(target_url)
             if not ru_title or not ru_body: return
 
@@ -741,7 +748,6 @@ async def auto_game8_parser():
                     ch = guild.get_channel(channel_id)
                     if ch:
                         try:
-                            # 1. Отправляем карточку-уведомление в сам канал
                             embed = discord.Embed(
                                 title=f"📚 Новый гайд: {ru_title}",
                                 url=target_url,
@@ -751,14 +757,11 @@ async def auto_game8_parser():
                             embed.set_footer(text="Game8 • Переведено ИИ", icon_url="https://game8.co/favicon.ico")
                             msg = await ch.send(embed=embed)
                             
-                            # 2. Создаем Ветку (Thread) от этого сообщения
                             thread = await msg.create_thread(name=ru_title[:100], auto_archive_duration=1440)
-                            
-                            # 3. Закидываем куски гайда внутрь ветки
                             chunks = split_text_for_discord(ru_body)
                             for chunk in chunks:
                                 await thread.send(chunk)
-                                await asyncio.sleep(1) # Небольшая пауза, чтобы не словить лимит Discord
+                                await asyncio.sleep(1)
                         except Exception as e:
                             print(f"Ошибка отправки ветки в Discord: {e}")
             
@@ -1093,17 +1096,16 @@ async def manual_game8_guide(ctx, url: str):
     if "game8.co" not in url:
         return await ctx.send("❌ Поддерживаются только ссылки с сайта Game8!")
 
-    loading_msg = await ctx.send("⏳ Читаю страницу, вытягиваю картинки и перевожу огромный текст. Это займет около 10-20 секунд...")
+    loading_msg = await ctx.send("⏳ Читаю страницу, чищу от мусора и перевожу текст. Это займет около 10-20 секунд...")
 
     ru_title, ru_body = await fetch_and_translate_guide(url)
     if not ru_title or not ru_body:
         return await loading_msg.edit(content="❌ Не удалось получить или перевести гайд. Возможно, неправильная ссылка или ИИ не ответил.")
 
-    # 1. Основное сообщение-заголовок
     embed = discord.Embed(
         title=f"📚 Новый гайд: {ru_title}",
         url=url,
-        description="⬇️ Полный переведенный гайд со всеми таблицами и картинками читайте в ветке ниже! ⬇️",
+        description="⬇️ Полный переведенный гайд читайте в ветке ниже! ⬇️",
         color=0x00A8FF
     )
     embed.set_footer(text="Game8 • Переведено ИИ", icon_url="https://game8.co/favicon.ico")
@@ -1114,10 +1116,7 @@ async def manual_game8_guide(ctx, url: str):
     await loading_msg.delete()
     msg = await ctx.send(embed=embed, view=view)
     
-    # 2. Создание ветки
     thread = await msg.create_thread(name=ru_title[:100], auto_archive_duration=1440)
-    
-    # 3. Отправка кусков
     chunks = split_text_for_discord(ru_body)
     for chunk in chunks:
         await thread.send(chunk)
