@@ -1,2 +1,5 @@
 [phases.setup]
 nixPkgs = ["python3", "postgresql_17"]
+
+[phases.build]
+cmds = ["pip install discord.py asyncpg aiohttp matplotlib pillow bs4 lxml pytz google-generativeai"]
