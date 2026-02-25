@@ -542,9 +542,84 @@ class TelegramBot:
 
 telegram = TelegramBot(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID)
 
+# ==================== СИСТЕМА ТИКЕТОВ (UI) ====================
+class TicketControlsView(discord.ui.View):
+    def __init__(self):
+        # Таймаут None нужен, чтобы кнопки работали после перезапуска бота
+        super().__init__(timeout=None)
 
-# ==================== КЛАСС БОТА (ДЛЯ МЯГКОГО ВЫКЛЮЧЕНИЯ) ====================
+    @discord.ui.button(label="🔒 Закрыть тикет", style=discord.ButtonStyle.danger, custom_id="close_ticket_btn")
+    async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message("⚠️ Тикет будет закрыт и удален через 5 секунд...", ephemeral=False)
+        await asyncio.sleep(5)
+        try:
+            await interaction.channel.delete(reason=f"Тикет закрыт пользователем {interaction.user}")
+        except discord.Forbidden:
+            pass # Если у бота почему-то отняли права
+
+class TicketView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="📩 Создать тикет", style=discord.ButtonStyle.primary, custom_id="create_ticket_btn")
+    async def create_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild = interaction.guild
+        
+        # 1. Ищем категорию "Тикеты", если нет - создаем
+        category = discord.utils.get(guild.categories, name="Тикеты")
+        if not category:
+            try:
+                category = await guild.create_category("Тикеты")
+            except discord.Forbidden:
+                return await interaction.response.send_message("❌ У меня нет прав для создания категории!", ephemeral=True)
+
+        # 2. Проверяем, нет ли уже открытого тикета от этого юзера
+        channel_name = f"тикет-{interaction.user.name.lower()}"
+        existing_channel = discord.utils.get(guild.channels, name=channel_name)
+        if existing_channel:
+            return await interaction.response.send_message(f"❌ У вас уже есть открытый тикет: {existing_channel.mention}", ephemeral=True)
+
+        # 3. Настраиваем права: видим только бот, создатель и админы
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(read_messages=False),
+            interaction.user: discord.PermissionOverwrite(read_messages=True, send_messages=True, attach_files=True),
+            guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_channels=True)
+        }
+        
+        # Добавляем права админам сервера
+        for role in guild.roles:
+            if role.permissions.administrator:
+                overwrites[role] = discord.PermissionOverwrite(read_messages=True, send_messages=True)
+
+        # 4. Создаем канал
+        try:
+            ticket_channel = await guild.create_text_channel(
+                name=channel_name,
+                category=category,
+                overwrites=overwrites,
+                reason=f"Тикет создан пользователем {interaction.user}"
+            )
+            
+            await interaction.response.send_message(f"✅ Ваш тикет успешно создан: {ticket_channel.mention}", ephemeral=True)
+            
+            # 5. Отправляем приветственное сообщение в тикет
+            embed = discord.Embed(
+                title="Обращение в поддержку",
+                description=f"Привет, {interaction.user.mention}!\nОпишите вашу проблему или задайте вопрос, и администрация ответит вам в ближайшее время.\n\nКогда вопрос будет решен, нажмите кнопку ниже для закрытия тикета.",
+                color=discord.Color.blue()
+            )
+            await ticket_channel.send(content=f"{interaction.user.mention}", embed=embed, view=TicketControlsView())
+            
+        except discord.Forbidden:
+            await interaction.response.send_message("❌ Ошибка прав: я не могу создавать каналы.", ephemeral=True)
+
+# ==================== КЛАСС БОТА (ДЛЯ МЯГКОГО ВЫКЛЮЧЕНИЯ И ТИКЕТОВ) ====================
 class ActivityBot(commands.Bot):
+    async def setup_hook(self):
+        # Регистрируем View для тикетов, чтобы они работали после перезапуска
+        self.add_view(TicketView())
+        self.add_view(TicketControlsView())
+
     async def close(self):
         print("\n🛑 Получен сигнал на выключение. Сохраняем данные...")
         now = datetime.datetime.now(datetime.timezone.utc)
@@ -993,7 +1068,18 @@ async def buy_role(ctx, *, role_name: str):
     await ctx.author.add_roles(role, reason="Покупка")
     await ctx.send(f"✅ Вы купили роль **{role.name}**!")
 
-# ---- СВОДКА И БЭКАП ----
+# ---- СВОДКА, БЭКАП И ТИКЕТЫ ----
+@bot.command(name="setup_tickets", aliases=["тикеты"])
+@commands.has_permissions(administrator=True)
+async def setup_tickets(ctx):
+    embed = discord.Embed(
+        title="📩 Служба поддержки",
+        description="У вас возник вопрос, проблема или жалоба?\nНажмите на кнопку ниже, чтобы создать приватный канал для связи с администрацией.",
+        color=discord.Color.blurple()
+    )
+    await ctx.send(embed=embed, view=TicketView())
+    await ctx.message.delete()
+
 @bot.command(name="помощь", aliases=["help", "команды"])
 async def help_command(ctx):
     embed = discord.Embed(
@@ -1017,7 +1103,8 @@ async def help_command(ctx):
     # Команды администратора (показываем только тем, у кого есть права)
     if ctx.author.guild_permissions.administrator:
         admin_cmds = (
-            "`!ручной_бэкап` (или `!бэкап`) — Принудительно сделать бэкап базы данных и отправить в Telegram"
+            "`!ручной_бэкап` (или `!бэкап`) — Принудительно сделать бэкап базы данных и отправить в Telegram\n"
+            "`!setup_tickets` — Разместить панель (кнопку) для создания тикетов в текущем канале"
         )
         embed.add_field(name="👑 Команды администратора", value=admin_cmds, inline=False)
         
