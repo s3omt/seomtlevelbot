@@ -17,6 +17,18 @@ import os
 import subprocess
 from PIL import Image, ImageDraw, ImageFont
 import asyncpg
+from bs4 import BeautifulSoup
+import google.generativeai as genai
+
+# ==================== НАСТРОЙКА ИИ ДЛЯ ПЕРЕВОДОВ ====================
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+    # Используем быструю и бесплатную модель
+    ai_model = genai.GenerativeModel('gemini-1.5-flash')
+else:
+    ai_model = None
+    print("⚠️ GEMINI_API_KEY не найден. Перевод гайдов работать не будет.")
 
 # ==================== РАБОТА С БАЗОЙ ДАННЫХ ====================
 class Database:
@@ -24,7 +36,6 @@ class Database:
         self.pool = None
 
     async def connect(self):
-        """Создаёт пул соединений с PostgreSQL с повторными попытками"""
         if self.pool is None:
             db_url = os.environ.get("DATABASE_URL")
             if not db_url:
@@ -34,18 +45,13 @@ class Database:
             for attempt in range(5):
                 try:
                     self.pool = await asyncpg.create_pool(
-                        db_url,
-                        min_size=1,
-                        max_size=10,
-                        command_timeout=60,
-                        ssl='require'
+                        db_url, min_size=1, max_size=10, command_timeout=60, ssl='require'
                     )
                     print(f"✅ Подключение к БД установлено (попытка {attempt+1})")
                     break
                 except Exception as e:
                     print(f"⚠️ Попытка {attempt+1}/5 подключения к БД не удалась: {e}")
                     if attempt == 4:
-                        print("❌ Не удалось подключиться к БД после 5 попыток")
                         return None
                     await asyncio.sleep(2 ** attempt)
         return self.pool
@@ -59,7 +65,7 @@ class Database:
                 CREATE TABLE IF NOT EXISTS users (user_id BIGINT PRIMARY KEY, messages INT DEFAULT 0, voice_minutes INT DEFAULT 0, reputation INT DEFAULT 0);
                 CREATE TABLE IF NOT EXISTS rep_cooldowns (user_id BIGINT PRIMARY KEY, last_rep TIMESTAMP);
                 CREATE TABLE IF NOT EXISTS guild_config (
-                    guild_id BIGINT PRIMARY KEY, log_channel BIGINT, backup_channel BIGINT,
+                    guild_id BIGINT PRIMARY KEY, log_channel BIGINT, backup_channel BIGINT, guides_channel BIGINT,
                     voice_events BOOLEAN DEFAULT TRUE, role_events BOOLEAN DEFAULT TRUE,
                     member_events BOOLEAN DEFAULT TRUE, channel_events BOOLEAN DEFAULT TRUE,
                     server_events BOOLEAN DEFAULT TRUE, message_events BOOLEAN DEFAULT FALSE,
@@ -78,10 +84,12 @@ class Database:
                 CREATE TABLE IF NOT EXISTS server_history (id SERIAL PRIMARY KEY, guild_id BIGINT, date DATE DEFAULT CURRENT_DATE, total_messages INT DEFAULT 0, total_voice_minutes INT DEFAULT 0, active_users INT DEFAULT 0, new_members INT DEFAULT 0, UNIQUE(guild_id, date));
                 CREATE TABLE IF NOT EXISTS profile_themes (id SERIAL PRIMARY KEY, name TEXT UNIQUE, accent_color INT, bg_color INT, card_color INT, overlay_url TEXT, style TEXT DEFAULT 'default', price BIGINT DEFAULT 0, preview_url TEXT, purchasable BOOLEAN DEFAULT TRUE);
                 CREATE TABLE IF NOT EXISTS user_profile (user_id BIGINT PRIMARY KEY, theme_id INT DEFAULT 1, custom_accent_color INT, custom_bg_color INT, FOREIGN KEY (theme_id) REFERENCES profile_themes(id));
+                
+                /* Таблица для отслеживания опубликованных гайдов */
+                CREATE TABLE IF NOT EXISTS posted_guides (url TEXT PRIMARY KEY, posted_at TIMESTAMP DEFAULT NOW());
             """)
             
-            # Миграции новых колонок
-            for col in ["backup_channel BIGINT", "economy_enabled BOOLEAN DEFAULT TRUE", "achievements_enabled BOOLEAN DEFAULT TRUE"]:
+            for col in ["backup_channel BIGINT", "guides_channel BIGINT", "economy_enabled BOOLEAN DEFAULT TRUE", "achievements_enabled BOOLEAN DEFAULT TRUE"]:
                 try: await conn.execute(f"ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS {col}")
                 except Exception: pass
             try: await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS reputation INT DEFAULT 0")
@@ -89,43 +97,50 @@ class Database:
             
             print("✅ База данных инициализирована")
 
+    # --- МЕТОДЫ ДЛЯ ГАЙДОВ ---
+    async def is_guide_posted(self, url: str):
+        pool = await self.connect()
+        if not pool: return True # Заглушка при ошибке БД
+        async with pool.acquire() as conn:
+            return bool(await conn.fetchval("SELECT 1 FROM posted_guides WHERE url = $1", url))
+
+    async def mark_guide_posted(self, url: str):
+        pool = await self.connect()
+        if pool:
+            async with pool.acquire() as conn:
+                await conn.execute("INSERT INTO posted_guides (url) VALUES ($1) ON CONFLICT DO NOTHING", url)
+
+    async def get_all_guide_channels(self):
+        pool = await self.connect()
+        if not pool: return []
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("SELECT guild_id, guides_channel FROM guild_config WHERE guides_channel IS NOT NULL")
+            return [(r['guild_id'], r['guides_channel']) for r in rows]
+
     # --- МЕТОДЫ РЕПУТАЦИИ ---
     async def can_give_rep(self, user_id: int):
         pool = await self.connect()
         if not pool: return False, 0
         async with pool.acquire() as conn:
-            # Считаем разницу времени прямо в базе данных, чтобы избежать багов с часовыми поясами
             row = await conn.fetchrow("SELECT EXTRACT(EPOCH FROM (NOW() AT TIME ZONE 'UTC' - last_rep)) AS diff FROM rep_cooldowns WHERE user_id = $1", user_id)
             if not row: return True, 0
-            
             diff = row['diff']
-            if diff >= 86400: # 24 часа = 86400 секунд
-                return True, 0
-            else:
-                return False, int(86400 - diff)
+            if diff >= 86400: return True, 0
+            else: return False, int(86400 - diff)
 
     async def add_reputation(self, sender_id: int, target_id: int):
         pool = await self.connect()
         if pool:
             async with pool.acquire() as conn:
-                await conn.execute("""
-                    INSERT INTO rep_cooldowns (user_id, last_rep) VALUES ($1, NOW() AT TIME ZONE 'UTC')
-                    ON CONFLICT (user_id) DO UPDATE SET last_rep = NOW() AT TIME ZONE 'UTC'
-                """, sender_id)
-                
-                await conn.execute("""
-                    INSERT INTO users (user_id, reputation) VALUES ($1, 1)
-                    ON CONFLICT (user_id) DO UPDATE SET reputation = COALESCE(users.reputation, 0) + 1
-                """, target_id)
-                
+                await conn.execute("INSERT INTO rep_cooldowns (user_id, last_rep) VALUES ($1, NOW() AT TIME ZONE 'UTC') ON CONFLICT (user_id) DO UPDATE SET last_rep = NOW() AT TIME ZONE 'UTC'", sender_id)
+                await conn.execute("INSERT INTO users (user_id, reputation) VALUES ($1, 1) ON CONFLICT (user_id) DO UPDATE SET reputation = COALESCE(users.reputation, 0) + 1", target_id)
                 return await conn.fetchval("SELECT reputation FROM users WHERE user_id = $1", target_id)
         return 0
 
     async def get_reputation(self, user_id: int):
         pool = await self.connect()
         if not pool: return 0
-        async with pool.acquire() as conn:
-            return await conn.fetchval("SELECT reputation FROM users WHERE user_id = $1", user_id) or 0
+        async with pool.acquire() as conn: return await conn.fetchval("SELECT reputation FROM users WHERE user_id = $1", user_id) or 0
 
     # --- МЕТОДЫ ПОЛЬЗОВАТЕЛЕЙ И СТАТИСТИКИ ---
     async def add_message(self, user_id: int):
@@ -248,7 +263,7 @@ class Database:
 
     async def get_guild_config(self, guild_id: int):
         pool = await self.connect()
-        default = {'guild_id': guild_id, 'log_channel': None, 'backup_channel': None, 'voice_events': True, 'role_events': True, 'member_events': True, 'channel_events': True, 'server_events': True, 'message_events': False, 'command_events': True, 'telegram_notify_role': False, 'telegram_daily_report': True, 'economy_enabled': True, 'achievements_enabled': True}
+        default = {'guild_id': guild_id, 'log_channel': None, 'backup_channel': None, 'guides_channel': None, 'voice_events': True, 'role_events': True, 'member_events': True, 'channel_events': True, 'server_events': True, 'message_events': False, 'command_events': True, 'telegram_notify_role': False, 'telegram_daily_report': True, 'economy_enabled': True, 'achievements_enabled': True}
         if not pool: return default
         async with pool.acquire() as conn:
             row = await conn.fetchrow("SELECT * FROM guild_config WHERE guild_id = $1", guild_id)
@@ -437,7 +452,7 @@ LEVEL_ROLES = {
     85: "Модератор по сиськам", 100: "Админ по ляжкам"
 }
 DEFAULT_ROLE_NAME = "Залётный"
-REP_REWARD_ROLE = "Ну крутой ля" # Роль за 10 репутации
+REP_REWARD_ROLE = "Ну крутой ля" 
 
 intents = discord.Intents.default()
 intents.members = True
@@ -542,10 +557,9 @@ class TelegramBot:
 
 telegram = TelegramBot(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID)
 
-# ==================== СИСТЕМА ТИКЕТОВ (UI) ====================
+# ==================== СИСТЕМА ТИКЕТОВ ====================
 class TicketControlsView(discord.ui.View):
     def __init__(self):
-        # Таймаут None нужен, чтобы кнопки работали после перезапуска бота
         super().__init__(timeout=None)
 
     @discord.ui.button(label="🔒 Закрыть тикет", style=discord.ButtonStyle.danger, custom_id="close_ticket_btn")
@@ -555,7 +569,7 @@ class TicketControlsView(discord.ui.View):
         try:
             await interaction.channel.delete(reason=f"Тикет закрыт пользователем {interaction.user}")
         except discord.Forbidden:
-            pass # Если у бота почему-то отняли права
+            pass
 
 class TicketView(discord.ui.View):
     def __init__(self):
@@ -564,8 +578,6 @@ class TicketView(discord.ui.View):
     @discord.ui.button(label="📩 Создать тикет", style=discord.ButtonStyle.primary, custom_id="create_ticket_btn")
     async def create_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
         guild = interaction.guild
-        
-        # 1. Ищем категорию "Тикеты", если нет - создаем
         category = discord.utils.get(guild.categories, name="Тикеты")
         if not category:
             try:
@@ -573,50 +585,43 @@ class TicketView(discord.ui.View):
             except discord.Forbidden:
                 return await interaction.response.send_message("❌ У меня нет прав для создания категории!", ephemeral=True)
 
-        # 2. Проверяем, нет ли уже открытого тикета от этого юзера
         channel_name = f"тикет-{interaction.user.name.lower()}"
         existing_channel = discord.utils.get(guild.channels, name=channel_name)
         if existing_channel:
             return await interaction.response.send_message(f"❌ У вас уже есть открытый тикет: {existing_channel.mention}", ephemeral=True)
 
-        # 3. Настраиваем права: видим только бот, создатель и админы
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(read_messages=False),
             interaction.user: discord.PermissionOverwrite(read_messages=True, send_messages=True, attach_files=True),
             guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_channels=True)
         }
-        
-        # Добавляем права админам сервера
         for role in guild.roles:
             if role.permissions.administrator:
                 overwrites[role] = discord.PermissionOverwrite(read_messages=True, send_messages=True)
 
-        # 4. Создаем канал
         try:
             ticket_channel = await guild.create_text_channel(
                 name=channel_name,
                 category=category,
                 overwrites=overwrites,
-                reason=f"Тикет создан пользователем {interaction.user}"
+                reason=f"Тикет от {interaction.user}"
             )
             
             await interaction.response.send_message(f"✅ Ваш тикет успешно создан: {ticket_channel.mention}", ephemeral=True)
             
-            # 5. Отправляем приветственное сообщение в тикет
             embed = discord.Embed(
                 title="Обращение в поддержку",
-                description=f"Привет, {interaction.user.mention}!\nОпишите вашу проблему или задайте вопрос, и администрация ответит вам в ближайшее время.\n\nКогда вопрос будет решен, нажмите кнопку ниже для закрытия тикета.",
+                description=f"Привет, {interaction.user.mention}!\nОпишите вашу проблему, и администрация ответит вам в ближайшее время.\n\nКогда вопрос будет решен, нажмите кнопку ниже.",
                 color=discord.Color.blue()
             )
             await ticket_channel.send(content=f"{interaction.user.mention}", embed=embed, view=TicketControlsView())
-            
         except discord.Forbidden:
             await interaction.response.send_message("❌ Ошибка прав: я не могу создавать каналы.", ephemeral=True)
 
-# ==================== КЛАСС БОТА (ДЛЯ МЯГКОГО ВЫКЛЮЧЕНИЯ И ТИКЕТОВ) ====================
+# ==================== КЛАСС БОТА ====================
 class ActivityBot(commands.Bot):
     async def setup_hook(self):
-        # Регистрируем View для тикетов, чтобы они работали после перезапуска
+        # Регистрируем кнопки, чтобы они работали после перезапуска
         self.add_view(TicketView())
         self.add_view(TicketControlsView())
 
@@ -625,28 +630,22 @@ class ActivityBot(commands.Bot):
         now = datetime.datetime.now(datetime.timezone.utc)
         saved_count = 0
         
-        # 1. Сохраняем недосчитанные минуты в голосовых каналах
         for user_id_str, session_start in list(voice_sessions.items()):
             duration = (now - session_start).total_seconds() / 60
             if duration >= 1:
                 member_id = int(user_id_str)
                 await db.add_voice_time(member_id, int(duration))
-                
                 coin_gain = int(duration) // 5
-                if coin_gain > 0:
-                    await db.add_coins(member_id, coin_gain)
-                
+                if coin_gain > 0: await db.add_coins(member_id, coin_gain)
                 await db.add_xp(member_id, int(duration) * 2)
                 saved_count += 1
                 
         print(f"✅ Сохранено голосовых сессий: {saved_count}")
 
-        # 2. Корректно закрываем соединения БД
         if db.pool:
             await db.pool.close()
             print("🔌 Соединение с БД корректно закрыто.")
             
-        # 3. Закрываем сессию Telegram
         if telegram.enabled:
             await telegram.close()
             print("📱 Соединение с Telegram закрыто.")
@@ -654,7 +653,6 @@ class ActivityBot(commands.Bot):
         print("👋 Бот успешно завершил работу.")
         await super().close()
 
-# Создаем бота с использованием нашего нового класса
 bot = ActivityBot(command_prefix="!", intents=intents, help_command=None)
 
 # ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
@@ -737,7 +735,6 @@ class RoleManager:
 
 # ==================== СИНХРОННЫЕ ФУНКЦИИ (ДЛЯ ВЫПОЛНЕНИЯ В ОТДЕЛЬНОМ ПОТОКЕ) ====================
 def _generate_activity_graph_sync(member_name: str, history: list):
-    """Синхронная функция генерации графика (не блокирует бота)"""
     dates = [row['date'].strftime('%d.%m') for row in history]
     voice_data = [row['voice_minutes'] / 60 for row in history]
     msg_data = [row['messages'] for row in history]
@@ -767,7 +764,6 @@ def _generate_activity_graph_sync(member_name: str, history: list):
     return buf
 
 def _generate_profile_card_sync(display_name, tag, member_id, level_info, balance, stats, achievements, current_role, avatar_bytes, theme):
-    """Синхронная генерация картинки профиля (не блокирует бота)"""
     W, H = 1000, 380
     AVATAR_SIZE = 120
     AVATAR_X, AVATAR_Y = 30, 30
@@ -781,9 +777,7 @@ def _generate_profile_card_sync(display_name, tag, member_id, level_info, balanc
     TEXT_COLOR = (255, 255, 255)
     SECONDARY_COLOR = (200, 200, 200)
 
-    # Загрузка шрифта
     try:
-        # Положите этот шрифт в папку с ботом
         font_large = ImageFont.truetype("Roboto-Medium.ttf", 32)
         font_medium = ImageFont.truetype("Roboto-Medium.ttf", 24)
         font_small = ImageFont.truetype("Roboto-Medium.ttf", 20)
@@ -838,6 +832,115 @@ def _generate_profile_card_sync(display_name, tag, member_id, level_info, balanc
     img.save(buf, format='PNG')
     buf.seek(0)
     return buf
+
+# ==================== ПАРСЕР GAME8 С ИИ ПЕРЕВОДОМ ====================
+async def translate_with_gemini(title: str, text: str) -> tuple:
+    if not ai_model:
+        return title, text # Если нет ключа, возвращаем английский текст
+    
+    prompt = f"""
+    Ты - профессиональный переводчик и эксперт по игре Arknights: Endfield.
+    Переведи заголовок и краткое описание статьи с сайта Game8 на русский язык. 
+    Используй правильный игровой сленг (Операторы, Урон, Навыки, АоЕ, Кастер и т.д.).
+    Сделай текст живым и интересным для геймеров.
+    
+    ЗАГОЛОВОК: {title}
+    ОПИСАНИЕ: {text}
+    
+    Ответь СТРОГО в таком формате:
+    [ЗАГОЛОВОК_РУС]
+    ===
+    [ОПИСАНИЕ_РУС]
+    """
+    try:
+        response = await asyncio.to_thread(ai_model.generate_content, prompt)
+        parts = response.text.split('===')
+        if len(parts) == 2:
+            return parts[0].strip(), parts[1].strip()
+        return title, response.text.strip()
+    except Exception as e:
+        print(f"Ошибка перевода Gemini: {e}")
+        return title, text
+
+@tasks.loop(minutes=30)
+async def auto_game8_parser():
+    """Фоновая задача: проверяет новые статьи на Game8 раз в 30 минут"""
+    url = "https://game8.co/games/Arknights-Endfield"
+    try:
+        async with aiohttp.ClientSession() as session:
+            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+            async with session.get(url, headers=headers) as resp:
+                if resp.status != 200: return
+                html = await resp.text()
+
+        soup = BeautifulSoup(html, 'lxml')
+        
+        # Ищем блок с последними статьями (обычно это a.a-link или блоки с классом archive)
+        # Поскольку игра еще не вышла, парсим основные ссылки со страницы хаба
+        links = soup.select('a.a-link') 
+        
+        new_guides = []
+        for link in links:
+            href = link.get('href')
+            if href and "/games/Arknights-Endfield/archives/" in href:
+                full_url = "https://game8.co" + href if href.startswith('/') else href
+                if not await db.is_guide_posted(full_url):
+                    new_guides.append(full_url)
+                    
+        # Обрабатываем только 1 новый гайд за раз, чтобы не спамить и не упереться в лимиты API
+        if new_guides:
+            target_url = new_guides[0]
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.get(target_url, headers=headers) as resp:
+                    article_html = await resp.text()
+            
+            article_soup = BeautifulSoup(article_html, 'lxml')
+            
+            title_meta = article_soup.find('meta', property='og:title')
+            en_title = title_meta['content'].replace(" | Game8", "") if title_meta else "Гайд Endfield"
+            
+            desc_meta = article_soup.find('meta', property='og:description')
+            en_desc = desc_meta['content'] if desc_meta else "Новая информация по игре по ссылке ниже."
+            
+            img_meta = article_soup.find('meta', property='og:image')
+            img_url = img_meta['content'] if img_meta else None
+
+            # Переводим через Gemini
+            ru_title, ru_desc = await translate_with_gemini(en_title, en_desc)
+
+            embed = discord.Embed(
+                title=f"📋 {ru_title}",
+                url=target_url,
+                description=ru_desc,
+                color=0x00A8FF,
+                timestamp=get_moscow_time()
+            )
+            if img_url:
+                embed.set_image(url=img_url)
+            embed.set_footer(text="Game8 • Переведено ИИ", icon_url="https://game8.co/favicon.ico")
+
+            view = discord.ui.View()
+            view.add_item(discord.ui.Button(label="Читать оригинал", style=discord.ButtonStyle.link, url=target_url))
+
+            # Отправляем во все настроенные каналы серверов
+            channels = await db.get_all_guide_channels()
+            for guild_id, channel_id in channels:
+                guild = bot.get_guild(guild_id)
+                if guild:
+                    ch = guild.get_channel(channel_id)
+                    if ch:
+                        try: await ch.send(embed=embed, view=view)
+                        except: pass
+            
+            await db.mark_guide_posted(target_url)
+
+    except Exception as e:
+        print(f"Ошибка фонового парсера Game8: {e}")
+
+@auto_game8_parser.before_loop
+async def before_parser():
+    await bot.wait_until_ready()
 
 # ==================== ЗАДАЧИ ====================
 @tasks.loop(minutes=5)
@@ -901,6 +1004,7 @@ async def on_ready():
     if telegram.enabled: await telegram.start_polling()
     if not collect_stats.is_running(): collect_stats.start()
     if telegram.enabled and not backup_db.is_running(): backup_db.start()
+    if not auto_game8_parser.is_running(): auto_game8_parser.start()
 
 @bot.event
 async def on_message(message):
@@ -940,6 +1044,13 @@ async def on_voice_state_update(member, before, after):
             del voice_sessions[uid]
 
 # ==================== КОМАНДЫ DISCORD ====================
+@bot.command(name="канал_гайдов")
+@commands.has_permissions(administrator=True)
+async def set_guides_channel(ctx, channel: discord.TextChannel):
+    """Устанавливает канал, куда будут автоматически скидываться гайды с Game8"""
+    await db.update_guild_config(ctx.guild.id, 'guides_channel', channel.id)
+    await ctx.send(f"✅ Теперь переведенные гайды с Game8 будут автоматически публиковаться в {channel.mention}")
+
 @bot.command(name="статистика")
 async def stats(ctx, member: discord.Member = None):
     member = member or ctx.author
@@ -961,14 +1072,12 @@ async def give_reputation(ctx, member: discord.Member):
     if member.id == ctx.author.id:
         return await ctx.send("❌ Нельзя выдать репутацию самому себе!")
 
-    # Проверка кулдауна (раз в 24 часа)
     can_give, cooldown_sec = await db.can_give_rep(ctx.author.id)
     if not can_give:
         hours = cooldown_sec // 3600
         mins = (cooldown_sec % 3600) // 60
         return await ctx.send(f"⏳ Вы уже выдавали репутацию сегодня. Подождите еще **{hours}ч {mins}м**.")
 
-    # Выдача репутации
     new_rep = await db.add_reputation(ctx.author.id, member.id)
 
     embed = discord.Embed(
@@ -978,7 +1087,6 @@ async def give_reputation(ctx, member: discord.Member):
     )
     await ctx.send(embed=embed)
 
-    # Проверка достижения 10 репутации для выдачи роли
     if new_rep >= 10:
         role = discord.utils.get(ctx.guild.roles, name=REP_REWARD_ROLE)
         if not role:
@@ -1000,7 +1108,6 @@ async def activity_graph(ctx, member: discord.Member = None):
             return await ctx.send("❌ Недостаточно данных.")
         history.reverse()
         
-        # Вызов синхронной функции генерации в отдельном потоке!
         buf = await asyncio.to_thread(_generate_activity_graph_sync, member.display_name, history)
         
         file = discord.File(buf, filename='activity.png')
@@ -1032,7 +1139,6 @@ async def profile(ctx, member: discord.Member = None):
         
         tag = f"{member.name}#{member.discriminator}" if member.discriminator != "0" else member.name
 
-        # Вызов синхронной функции отрисовки в отдельном потоке!
         buf = await asyncio.to_thread(
             _generate_profile_card_sync,
             member.display_name, tag, member.id, level_info, balance, stats, achievements[:3], current_role, avatar_bytes, theme
@@ -1068,7 +1174,6 @@ async def buy_role(ctx, *, role_name: str):
     await ctx.author.add_roles(role, reason="Покупка")
     await ctx.send(f"✅ Вы купили роль **{role.name}**!")
 
-# ---- СВОДКА, БЭКАП И ТИКЕТЫ ----
 @bot.command(name="setup_tickets", aliases=["тикеты"])
 @commands.has_permissions(administrator=True)
 async def setup_tickets(ctx):
@@ -1089,7 +1194,6 @@ async def help_command(ctx):
         timestamp=get_moscow_time()
     )
     
-    # Команды для всех пользователей
     user_cmds = (
         "`!профиль` (или `!rank`) — Ваша красивая карточка профиля со статистикой\n"
         "`!статистика [@юзер]` — Подробная текстовая статистика активности\n"
@@ -1100,11 +1204,11 @@ async def help_command(ctx):
     )
     embed.add_field(name="👤 Основные команды", value=user_cmds, inline=False)
     
-    # Команды администратора (показываем только тем, у кого есть права)
     if ctx.author.guild_permissions.administrator:
         admin_cmds = (
-            "`!ручной_бэкап` (или `!бэкап`) — Принудительно сделать бэкап базы данных и отправить в Telegram\n"
-            "`!setup_tickets` — Разместить панель (кнопку) для создания тикетов в текущем канале"
+            "`!ручной_бэкап` (или `!бэкап`) — Сделать бэкап базы данных в Telegram\n"
+            "`!setup_tickets` — Разместить панель для создания тикетов\n"
+            "`!канал_гайдов #канал` — Выбрать канал для авто-постинга гайдов Game8"
         )
         embed.add_field(name="👑 Команды администратора", value=admin_cmds, inline=False)
         
@@ -1115,14 +1219,12 @@ async def help_command(ctx):
 @bot.command(name="ручной_бэкап", aliases=["бэкап", "backup"])
 @commands.has_permissions(administrator=True)
 async def manual_backup(ctx):
-    # Проверяем, настроен ли Telegram
     if not telegram.enabled:
         await ctx.send("❌ Telegram-бот не настроен. Для получения бэкапов укажите токены в переменных окружения.")
         return
         
     await ctx.send("⏳ Создаю резервную копию базы данных...")
     
-    # Проверяем наличие утилиты pg_dump
     pg_dump_path = subprocess.run(["which", "pg_dump"], capture_output=True, text=True).stdout.strip()
     if not pg_dump_path:
         await ctx.send("❌ Утилита `pg_dump` не найдена в системе. Убедитесь, что `postgresql` добавлен в Nixpacks на Railway.")
@@ -1133,22 +1235,17 @@ async def manual_backup(ctx):
         await ctx.send("❌ Не найдена переменная `DATABASE_URL`.")
         return
     
-    # Формируем файл и делаем дамп
     filename = f"manual_backup_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.sql"
     res = subprocess.run(["pg_dump", db_url, "-T", "user_history", "-f", filename], capture_output=True, text=True)
     
     if res.returncode == 0:
-        # Отправляем в Telegram
         success = await telegram.send_document(
             filename, 
             f"📦 **Ручной бэкап БД**\nЗапросил: {ctx.author.display_name}\nСервер: {ctx.guild.name}\n⏰ {format_moscow_time()}"
         )
-        os.remove(filename) # Удаляем файл с сервера после отправки
-        
-        if success:
-            await ctx.send("✅ Бэкап успешно создан и отправлен в ваш Telegram!")
-        else:
-            await ctx.send("⚠️ Бэкап создан, но произошла ошибка при отправке в Telegram. Проверьте ID чата.")
+        os.remove(filename)
+        if success: await ctx.send("✅ Бэкап успешно создан и отправлен в ваш Telegram!")
+        else: await ctx.send("⚠️ Бэкап создан, но произошла ошибка при отправке в Telegram. Проверьте ID чата.")
     else:
         await ctx.send(f"❌ Ошибка при создании бэкапа:\n```text\n{res.stderr}\n```")
 
