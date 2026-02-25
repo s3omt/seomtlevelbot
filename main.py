@@ -34,6 +34,7 @@ class Database:
         self.pool = None
 
     async def connect(self):
+        """Создаёт пул соединений с PostgreSQL с повторными попытками"""
         if self.pool is None:
             db_url = os.environ.get("DATABASE_URL")
             if not db_url:
@@ -50,6 +51,7 @@ class Database:
                 except Exception as e:
                     print(f"⚠️ Попытка {attempt+1}/5 подключения к БД не удалась: {e}")
                     if attempt == 4:
+                        print("❌ Не удалось подключиться к БД после 5 попыток")
                         return None
                     await asyncio.sleep(2 ** attempt)
         return self.pool
@@ -631,46 +633,38 @@ def split_text_for_discord(text: str, max_len: int = 1900):
 
 async def fetch_and_translate_guide(url: str):
     if not ai_client:
-        return None, None
+        return None, None, None
         
     try:
         async with aiohttp.ClientSession() as session:
             headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
             async with session.get(url, headers=headers) as resp:
-                if resp.status != 200: return None, None
+                if resp.status != 200: return None, None, None
                 html = await resp.text()
 
         soup = BeautifulSoup(html, 'lxml')
         
+        # Получаем заголовок
         title_meta = soup.find('meta', property='og:title')
         en_title = title_meta['content'].replace(" | Game8", "") if title_meta else "Гайд Endfield"
+        
+        # Получаем главную обложку статьи (для карточки-анонса)
+        img_meta = soup.find('meta', property='og:image')
+        cover_url = img_meta['content'] if img_meta else None
         
         content = soup.find('div', class_='archive-style-wrapper')
         if not content:
             content = soup.find('article') or soup.body
 
         # 1. УБИВАЕМ МУСОРНЫЕ ССЫЛКИ, СОХРАНЯЯ ТЕКСТ
-        # Это предотвратит спам ссылками на тирлисты внутри текста
         for a_tag in content.find_all('a'):
             a_tag.unwrap() # Снимает тег <a>, оставляя текст внутри него
 
-        # 2. ФИЛЬТРУЕМ КАРТИНКИ
+        # 2. УБИВАЕМ АБСОЛЮТНО ВСЕ КАРТИНКИ ИЗ ТЕЛА СТАТЬИ
         for img in content.find_all('img'):
-            src = img.get('data-src') or img.get('src', '')
-            class_name = img.get('class', [])
-            
-            # Удаляем иконки, счетчики, базовый UI
-            if not src or src.startswith('data:image') or 'icon' in src.lower() or 'a-icon' in class_name:
-                img.decompose()
-                continue
-                
-            if src.startswith('//'): src = 'https:' + src
-            elif src.startswith('/'): src = 'https://game8.co' + src
-            
-            # Вставляем картинку с отступами
-            img.replace_with(f"\n\n{src}\n\n")
+            img.decompose()
 
-        # Удаляем мусорные блоки Game8
+        # 3. Удаляем мусорные блоки Game8 (рекламу, оглавления, боковые панели)
         for tag in content(['script', 'style', 'ins', 'iframe', 'nav', 'div.toc']):
             tag.decompose()
             
@@ -685,11 +679,10 @@ async def fetch_and_translate_guide(url: str):
         ЗАГОЛОВОК СТАТЬИ: {en_title}
 
         ПРАВИЛА ОФОРМЛЕНИЯ:
-        1. Переведи ВЕСЬ полезный текст. Не делай кратких выжимок!
-        2. Используй Markdown Discord.
-        3. В тексте есть прямые ссылки на картинки (начинаются с https://...). ОБЯЗАТЕЛЬНО оставляй эти ссылки ровно на тех же местах в тексте, где они находятся сейчас. КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО группировать ссылки на картинки в конце текста! Они должны стоять там же, где были в оригинале.
-        4. Если есть HTML-таблицы, преврати их в аккуратные списки.
-        5. Используй правильный игровой сленг.
+        1. Переведи ВЕСЬ полезный текст статьи. Не делай кратких выжимок, сохраняй подробности!
+        2. Используй Markdown Discord для красивого оформления (жирный шрифт, заголовки, списки).
+        3. Если в тексте есть HTML-таблицы, преврати их в аккуратные текстовые списки.
+        4. Используй правильный игровой сленг (АоЕ, Урон, Операторы, Кастер и т.д.).
 
         ОТВЕТ ВЫДАЙ СТРОГО В ТАКОМ ФОРМАТЕ (с разделителем ===):
         [Переведенный Заголовок]
@@ -708,12 +701,12 @@ async def fetch_and_translate_guide(url: str):
         
         parts = response.text.split('===')
         if len(parts) == 2:
-            return parts[0].strip(), parts[1].strip()
-        return en_title, response.text.strip()
+            return parts[0].strip(), parts[1].strip(), cover_url
+        return en_title, response.text.strip(), cover_url
         
     except Exception as e:
         print(f"Ошибка парсинга/перевода: {e}")
-        return None, None
+        return None, None, None
 
 @tasks.loop(minutes=30)
 async def auto_game8_parser():
@@ -738,7 +731,7 @@ async def auto_game8_parser():
                     
         if new_guides:
             target_url = new_guides[0]
-            ru_title, ru_body = await fetch_and_translate_guide(target_url)
+            ru_title, ru_body, cover_url = await fetch_and_translate_guide(target_url)
             if not ru_title or not ru_body: return
 
             channels = await db.get_all_guide_channels()
@@ -754,7 +747,10 @@ async def auto_game8_parser():
                                 description="⬇️ Полный переведенный гайд читайте в ветке ниже! ⬇️",
                                 color=0x00A8FF
                             )
+                            if cover_url:
+                                embed.set_image(url=cover_url)
                             embed.set_footer(text="Game8 • Переведено ИИ", icon_url="https://game8.co/favicon.ico")
+                            
                             msg = await ch.send(embed=embed)
                             
                             thread = await msg.create_thread(name=ru_title[:100], auto_archive_duration=1440)
@@ -1096,18 +1092,20 @@ async def manual_game8_guide(ctx, url: str):
     if "game8.co" not in url:
         return await ctx.send("❌ Поддерживаются только ссылки с сайта Game8!")
 
-    loading_msg = await ctx.send("⏳ Читаю страницу, чищу от мусора и перевожу текст. Это займет около 10-20 секунд...")
+    loading_msg = await ctx.send("⏳ Читаю страницу и перевожу текст (картинки вырезаны для читаемости). Это займет около 10 секунд...")
 
-    ru_title, ru_body = await fetch_and_translate_guide(url)
+    ru_title, ru_body, cover_url = await fetch_and_translate_guide(url)
     if not ru_title or not ru_body:
         return await loading_msg.edit(content="❌ Не удалось получить или перевести гайд. Возможно, неправильная ссылка или ИИ не ответил.")
 
     embed = discord.Embed(
         title=f"📚 Новый гайд: {ru_title}",
         url=url,
-        description="⬇️ Полный переведенный гайд читайте в ветке ниже! ⬇️",
+        description="⬇️ Полный переведенный текст читайте в ветке ниже! ⬇️",
         color=0x00A8FF
     )
+    if cover_url:
+        embed.set_image(url=cover_url)
     embed.set_footer(text="Game8 • Переведено ИИ", icon_url="https://game8.co/favicon.ico")
     
     view = discord.ui.View()
