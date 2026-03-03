@@ -1127,6 +1127,17 @@ async def set_guides_channel(ctx, channel: discord.TextChannel):
     await db.update_guild_config(ctx.guild.id, 'guides_channel', channel.id)
     await ctx.send(f"✅ Теперь переведенные гайды с Game8 будут автоматически публиковаться в {channel.mention}")
 
+@bot.command(name="канал_логов")
+@commands.has_permissions(administrator=True)
+async def set_log_channel_cmd(ctx, channel: discord.TextChannel):
+    """Устанавливает канал для логирования событий сервера"""
+    await db.set_log_channel(ctx.guild.id, channel.id)
+    
+    if ctx.guild.id in guild_config_cache:
+        del guild_config_cache[ctx.guild.id]
+        
+    await ctx.send(f"✅ Канал логов успешно установлен на {channel.mention}")
+
 @bot.command(name="статистика")
 async def stats(ctx, member: discord.Member = None):
     member = member or ctx.author
